@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -17,134 +16,19 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/h2non/bimg"
 	lru "github.com/hashicorp/golang-lru/v2"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
 )
-
-type Config struct {
-	WebP struct {
-		Quality      int  `mapstructure:"quality"`
-		Lossless     bool `mapstructure:"lossless"`
-		NearLossless int  `mapstructure:"near_lossless"`
-	} `mapstructure:"webp"`
-	Cache struct {
-		// ExpirationMinutes int    `mapstructure:"expiration_minutes"`
-		CacheEnabled  bool   `mapstructure:"cache_enabled"`
-		NoCacheHeader string `mapstructure:"nocache_header"`
-		LruCache      int    `mapstructure:"lru_cache"`
-	} `mapstructure:"cache"`
-	Concurrency struct {
-		MaxGoroutines int `mapstructure:"max_goroutines"`
-	} `mapstructure:"concurrency"`
-	HTTPClient struct {
-		TimeoutSeconds        int `mapstructure:"timeout_seconds"`
-		DialTimeoutSeconds    int `mapstructure:"dial_timeout_seconds"`
-		KeepAlive             int `mapstructure:"keep_alive"`
-		TLSHandshakeTimeout   int `mapstructure:"TLS_handshake_timeout"`
-		ResponseHeaderTimeout int `mapstructure:"response_header_timeout"`
-		ExpectContinueTimeout int `mapstructure:"expect_continue_timeout"`
-	} `mapstructure:"http_client"`
-	AllowedHosts map[string]string `mapstructure:"allowed_hosts"`
-	Limits       struct {
-		MaxImageBytes int64 `mapstructure:"max_image_bytes"`
-	} `mapstructure:"limits"`
-	Exporter struct {
-		BindIP   string `mapstructure:"bind_ip"`
-		Port     int    `mapstructure:"port"`
-		User     string `mapstructure:"user"`
-		Password string `mapstructure:"password"`
-	} `mapstructure:"exporter"`
-	HTTPServer struct {
-		BindIP string `mapstructure:"bind_ip"`
-		Port   int    `mapstructure:"port"`
-	} `mapstructure:"http_server"`
-}
-
-// defaultMaxImageBytes caps the size of an upstream image when limits.max_image_bytes is unset.
-const defaultMaxImageBytes = 20 << 20
 
 // upstreamScheme is the scheme used for upstream fetches; overridden in tests.
 var upstreamScheme = "https://"
 
 var (
-	requestsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ngax_http_requests_total",
-			Help: "Total number of HTTP requests.",
-		},
-		[]string{"status_code", "method"},
-	)
-
-	responseDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name: "ngax_http_response_duration_seconds",
-			Help: "Histogram of HTTP response durations.",
-		},
-		[]string{"status_code", "method"},
-	)
-
-	cacheHitsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_cache_hits_total",
-			Help: "Total number of cache hits.",
-		},
-	)
-
-	cacheMissesTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_cache_misses_total",
-			Help: "Total number of cache misses.",
-		},
-	)
-
-	errorsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_http_errors_total",
-			Help: "Total number of HTTP errors.",
-		},
-	)
-
-	totalImageSizeBeforeConversion = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_total_image_size_before_conversion_bytes",
-			Help: "Total size of images before conversion in bytes.",
-		},
-	)
-
-	// Total size of images after conversion
-	totalImageSizeAfterConversion = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_total_image_size_after_conversion_bytes",
-			Help: "Total size of images after conversion in bytes.",
-		},
-	)
-
-	invalidHostsCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ngax_invalid_hosts_count",
-			Help: "Count of unauthorized host access attempts.",
-		},
-	)
-
-	config     Config
 	imgCache   *lru.TwoQueueCache[string, []byte]
 	logger     = newLogger()
 	httpClient *http.Client
 	semaphore  chan struct{}
 )
-
-func init() {
-	prometheus.MustRegister(requestsTotal)
-	prometheus.MustRegister(responseDuration)
-	prometheus.MustRegister(cacheHitsTotal)
-	prometheus.MustRegister(cacheMissesTotal)
-	prometheus.MustRegister(errorsTotal)
-	prometheus.MustRegister(totalImageSizeBeforeConversion)
-	prometheus.MustRegister(totalImageSizeAfterConversion)
-	prometheus.MustRegister(invalidHostsCount)
-}
 
 func newLogger() *logrus.Logger {
 	l := logrus.New()
@@ -154,52 +38,17 @@ func newLogger() *logrus.Logger {
 	return l
 }
 
-// loadConfig reads config.yaml from dir into the global config.
-func loadConfig(dir string) error {
-	// Hostnames are map keys in allowed_hosts, so the default "." key
-	// delimiter must not be used or viper would split them into nested maps.
-	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(dir)
-	if err := v.ReadInConfig(); err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
-	if err := v.Unmarshal(&config); err != nil {
-		return fmt.Errorf("decoding config: %w", err)
-	}
-	return nil
-}
-
 // setupRuntime builds the cache, HTTP client and semaphore from the loaded config.
 func setupRuntime() error {
 	var err error
-	imgCache, err = lru.New2Q[string, []byte](config.Cache.LruCache)
+	imgCache, err = lru.New2Q[string, []byte](1024)
 	if err != nil {
 		return fmt.Errorf("creating cache: %w", err)
 	}
 
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   time.Duration(config.HTTPClient.DialTimeoutSeconds) * time.Second,
-				KeepAlive: time.Duration(config.HTTPClient.KeepAlive) * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   time.Duration(config.HTTPClient.TLSHandshakeTimeout) * time.Second,
-			ResponseHeaderTimeout: time.Duration(config.HTTPClient.ResponseHeaderTimeout) * time.Second,
-			ExpectContinueTimeout: time.Duration(config.HTTPClient.ExpectContinueTimeout) * time.Second,
-			MaxIdleConns:          100,
-		},
-		Timeout: time.Second * time.Duration(config.HTTPClient.TimeoutSeconds),
-	}
+	httpClient = newHTTPClient(&config)
 
-	if config.Concurrency.MaxGoroutines <= 0 {
-		config.Concurrency.MaxGoroutines = 1
-	}
-	semaphore = make(chan struct{}, config.Concurrency.MaxGoroutines)
-	if config.Limits.MaxImageBytes <= 0 {
-		config.Limits.MaxImageBytes = defaultMaxImageBytes
-	}
+	semaphore = make(chan struct{}, config.Concurrency.MaxConversions)
 	return nil
 }
 
@@ -250,24 +99,6 @@ func newRouter() *mux.Router {
 	return router
 }
 
-// statusRecorder captures the status code written by a handler.
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	r.status = code
-	r.ResponseWriter.WriteHeader(code)
-}
-
-func (r *statusRecorder) Write(b []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	return r.ResponseWriter.Write(b)
-}
-
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	rec := &statusRecorder{ResponseWriter: w}
@@ -295,7 +126,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imageURL := buildImageURL(allowedHost, r.URL.Path, r.URL.RawQuery)
+	imageURL := buildImageURL(upstreamScheme, allowedHost, r.URL.Path, r.URL.RawQuery)
 
 	useCache := config.Cache.CacheEnabled && r.Header.Get(config.Cache.NoCacheHeader) != "true"
 	if useCache {
@@ -425,27 +256,4 @@ func basicAuthMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// resolveQuality returns the WebP quality to use: the header value when it is
-// a valid integer in 1..100 (values above 100 are clamped), otherwise def.
-func resolveQuality(header string, def int) int {
-	q, err := strconv.Atoi(header)
-	if err != nil || q <= 0 {
-		return def
-	}
-	if q > 100 {
-		return 100
-	}
-	return q
-}
-
-// buildImageURL builds the upstream URL, keeping the query string so that
-// distinct variants of an image are fetched and cached separately.
-func buildImageURL(host, path, rawQuery string) string {
-	u := upstreamScheme + host + path
-	if rawQuery != "" {
-		u += "?" + rawQuery
-	}
-	return u
 }

@@ -6,62 +6,25 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestResolveQualityUsesHeaderWithinRange(t *testing.T) {
-	if got := resolveQuality("42", 75); got != 42 {
-		t.Fatalf("want 42, got %d", got)
-	}
-}
-
-func TestResolveQualityFallsBackOnEmptyOrInvalid(t *testing.T) {
-	for _, h := range []string{"", "abc", "0", "-5"} {
-		if got := resolveQuality(h, 75); got != 75 {
-			t.Errorf("header %q: want 75, got %d", h, got)
-		}
-	}
-}
-
-func TestResolveQualityClampsAbove100(t *testing.T) {
-	if got := resolveQuality("500", 75); got != 100 {
-		t.Fatalf("want 100, got %d", got)
-	}
-}
-
-func TestBuildImageURLPreservesQueryString(t *testing.T) {
-	got := buildImageURL("cdn.example.com", "/a/b.jpg", "v=2&w=10")
-	want := "https://cdn.example.com/a/b.jpg?v=2&w=10"
-	if got != want {
-		t.Fatalf("want %s, got %s", want, got)
-	}
-}
-
-func TestBuildImageURLWithoutQueryString(t *testing.T) {
-	got := buildImageURL("cdn.example.com", "/a/b.jpg", "")
-	want := "https://cdn.example.com/a/b.jpg"
-	if got != want {
-		t.Fatalf("want %s, got %s", want, got)
-	}
-}
-
 func testConfig(t *testing.T) {
 	t.Helper()
 	config = Config{}
-	config.Cache.LruCache = 16
 	config.Cache.CacheEnabled = true
 	config.Cache.NoCacheHeader = "X-No-Cache"
-	config.Concurrency.MaxGoroutines = 4
 	config.WebP.Quality = 75
 	config.Limits.MaxImageBytes = 10 << 20
-	config.HTTPClient.TimeoutSeconds = 2
 	// Point at a closed local port so unexpected upstream fetches fail fast.
 	config.AllowedHosts = map[string]string{"cdn.test": "127.0.0.1:1"}
+	config.applyDefaults()
+	config.Cache.MaxBytes = 1 << 20
+	config.Concurrency.MaxConversions = 4
+	config.HTTPClient.TimeoutSeconds = 2
 	upstreamScheme = "http://"
 	t.Cleanup(func() { upstreamScheme = "https://" })
 	if err := setupRuntime(); err != nil {
@@ -173,23 +136,5 @@ func TestHandleRequestSkipsCacheWhenDisabled(t *testing.T) {
 	}
 	if imgCache.Len() != 0 {
 		t.Fatalf("cache should be empty when disabled, has %d entries", imgCache.Len())
-	}
-}
-
-func TestLoadConfigKeepsDottedHostKeys(t *testing.T) {
-	dir := t.TempDir()
-	yaml := "allowed_hosts:\n  example.com: \"images.example.com\"\nwebp:\n  quality: 60\n"
-	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	config = Config{}
-	if err := loadConfig(dir); err != nil {
-		t.Fatal(err)
-	}
-	if got := config.AllowedHosts["example.com"]; got != "images.example.com" {
-		t.Fatalf("want images.example.com, got %q (all: %v)", got, config.AllowedHosts)
-	}
-	if config.WebP.Quality != 60 {
-		t.Fatalf("want quality 60, got %d", config.WebP.Quality)
 	}
 }
