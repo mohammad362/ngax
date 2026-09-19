@@ -3,3 +3,5 @@
 stress-test
 config.yaml
 *.md
+loadtest/
+docs/

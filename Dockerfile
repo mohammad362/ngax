@@ -1,28 +1,20 @@
-# Use the official Golang Alpine image as the base image
-FROM golang:alpine
-
-# Set the working directory inside the container
-WORKDIR /app
-
-# Install libvips and its dependencies
-RUN apk --no-cache add build-base \
-    && apk --no-cache add vips-dev \
-    && apk --no-cache add gcc \
-    && apk --no-cache add g++ \
-    && apk --no-cache add libc6-compat
-
-# Copy the go.mod and go.sum files to download dependencies
-# This is done before copying the source code to leverage Docker cache
+# syntax=docker/dockerfile:1
+FROM golang:alpine AS build
+RUN apk --no-cache add build-base vips-dev
+WORKDIR /src
 COPY go.mod go.sum ./
-
-# Download the dependencies
 RUN go mod download
-
-# Copy the rest of the source code
 COPY . .
+RUN CGO_ENABLED=1 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /ngax .
 
-# Build the application
-RUN go build -o main .
-
-# Command to run the executable
-CMD ["./main"]
+FROM alpine:3.20
+RUN apk --no-cache add vips ca-certificates tzdata \
+    && addgroup -S ngax && adduser -S -G ngax ngax
+WORKDIR /app
+COPY --from=build /ngax /app/ngax
+USER ngax
+ENV VIPS_CONCURRENCY=1 \
+    MALLOC_ARENA_MAX=2
+EXPOSE 8080 9080
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+CMD ["/app/ngax"]

@@ -14,33 +14,40 @@ webp:
 
 # Caching Settings
 cache:
-  expiration_minutes: 60            # Cache expiration time in minutes
   cache_enabled: true
-  nocache_header: "X-No-Cache" # You can change the header name as needed
-  lru_cache: 300000
+  nocache_header: "X-No-Cache"      # Request header that bypasses the cache when set to "true"
+  max_bytes: 1073741824             # Memory ceiling for cached images (1 GiB)
+  negative_ttl_seconds: 30          # Remember origin 404s for this long; -1 disables
 
 # Upstream Limits
 limits:
-  max_image_bytes: 20971520         # Reject upstream images larger than this (bytes, default 20 MiB)
+  max_image_bytes: 20971520         # Reject upstream images larger than this (20 MiB)
 
 # Concurrency Settings
 concurrency:
-  max_goroutines: 500                # Maximum number of goroutines
+  max_conversions: 0                # Concurrent libvips conversions; 0 = number of CPUs
+  max_fetches: 512                  # Concurrent origin fetches
 
-# HTTP Client Settings
+# HTTP Client Settings (seconds)
 http_client:
-  timeout_seconds: 40               # HTTP client timeout in seconds
-  dial_timeout_seconds: 5               # HTTP client timeout in seconds
+  timeout_seconds: 30
+  dial_timeout_seconds: 5
   keep_alive: 30
   TLS_handshake_timeout: 10
   response_header_timeout: 30
   expect_continue_timeout: 1
   idle_conn_timeout: 90
-
+  max_idle_conns_per_host: 256      # Idle connections kept per origin host
 
 http_server:
   bind_ip: "127.0.0.1"
   port: 8080
+  read_header_timeout_seconds: 5
+  idle_timeout_seconds: 60
+  cache_control: "public, max-age=31536000, immutable"   # Sent with every image response
+
+log:
+  level: info                       # debug | info | warn | error
 
 exporter:
   bind_ip: "127.0.0.1"
