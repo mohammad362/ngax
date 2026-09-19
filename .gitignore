@@ -6,3 +6,4 @@ loadtest/cpu.pprof
 loadtest/config.yaml
 loadtest/targets.txt
 loadtest/targets-miss.txt
+loadtest/targets-burst.txt

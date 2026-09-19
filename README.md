@@ -10,7 +10,7 @@ are rejected with `403`.
 
 ## Requirements
 
-- Go 1.21 or newer
+- Go 1.24 or newer (or just Docker: everything runs via `make`)
 - libvips 8.x with development headers (`vips-dev` on Alpine, `libvips-dev` on Debian/Ubuntu)
 - Docker (optional, for containerised builds)
 
@@ -18,6 +18,11 @@ are rejected with `403`.
 
 Copy `config.yaml.sample` to `config.yaml` and adjust it. The file is read from
 the working directory at start-up.
+
+Two keys from older versions are deprecated: `cache.lru_cache` (superseded by
+`cache.max_bytes`) and `concurrency.max_goroutines` (superseded by
+`concurrency.max_conversions`). Both still decode, so an old `config.yaml`
+keeps loading, but both are **ignored** and each logs a warning at start-up.
 
 | Section       | Key                | Purpose                                                        |
 |---------------|--------------------|----------------------------------------------------------------|
@@ -28,6 +33,7 @@ the working directory at start-up.
 | `cache`       | `nocache_header`   | Request header that bypasses the cache when set to `true`       |
 | `cache`       | `max_bytes`        | Memory ceiling for cached images, in bytes (default 1 GiB)      |
 | `cache`       | `negative_ttl_seconds` | How long origin 404s are remembered, in seconds; `-1` disables |
+| `upstream_scheme` | —              | `https://` (default) or `http://` for local testing              |
 | `limits`      | `max_image_bytes`  | Reject upstream images larger than this (default 20 MiB)        |
 | `concurrency` | `max_conversions`  | Concurrent libvips conversions; `0` = number of CPUs             |
 | `concurrency` | `max_fetches`      | Concurrent origin fetches                                        |
@@ -72,9 +78,13 @@ curl -H 'Host: example.com' http://localhost:8080/images/photo.jpg -o photo.webp
 
 ## Development
 
+Everything runs in the Docker dev image, so no local Go or libvips is needed:
+
 ```bash
-go vet ./...
-go test ./...
+make test     # go test ./...
+make vet      # gofmt -l . && go vet ./...
+make bench    # micro-benchmarks (see docs/loadtest.md for the baseline)
+make sh       # shell in the dev image
 ```
 
 `stress-test/test.go` is a standalone load generator; edit the constants at the

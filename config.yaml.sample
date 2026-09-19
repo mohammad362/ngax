@@ -40,7 +40,7 @@ http_client:
   max_idle_conns_per_host: 256      # Idle connections kept per origin host
 
 http_server:
-  bind_ip: "127.0.0.1"
+  bind_ip: "127.0.0.1"          # inside a container use 0.0.0.0 so published ports work
   port: 8080
   read_header_timeout_seconds: 5
   idle_timeout_seconds: 60
@@ -50,7 +50,7 @@ log:
   level: info                       # debug | info | warn | error
 
 exporter:
-  bind_ip: "127.0.0.1"
+  bind_ip: "127.0.0.1"          # inside a container use 0.0.0.0 so published ports work
   port: 9080
-  user: "foo"
-  password: "bar"  
+  user: "foo"                   # leaving user/password empty on a non-loopback
+  password: "bar"               # bind_ip is warned about at start-up

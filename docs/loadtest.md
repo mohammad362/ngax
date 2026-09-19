@@ -7,38 +7,65 @@ Docker only. `make image` builds the dev toolchain image.
 ## Run
 
     make image
-    sh loadtest/run.sh 2000 60s     # rate (rps), duration
+    sh loadtest/run.sh 1000 30s     # rate (rps), duration
 
-The script starts a synthetic origin (1000 distinct 512×512 PNGs, plus a
-second disjoint set of 1000 used only for profiling), starts ngAX pointed at
-it over plain HTTP, warms the cache, attacks at the given rate and prints a
-vegeta report and ngAX metrics, then resets the origin's request counter and
-takes a 30 s CPU profile (saved to `loadtest/cpu.pprof`) while attacking the
-second, never-before-seen set of 1000 images — so the profile captures a
-miss-heavy (fetch + convert) phase instead of an already-fully-cached one.
+The script runs four phases against a synthetic origin (1000 distinct
+512x512 PNGs, a second disjoint set of 1000, and one further image used only
+for the burst) with ngAX pointed at it over plain HTTP:
 
-The warm-up phase issues 1000 first-time (cold) fetch+convert requests at a
-rate tuned to this repo's 12-CPU dev/CI hardware: `-rate=100 -duration=15s`.
-Converting a fresh 512×512 PNG through libvips takes tens of ms even with
-`concurrency.max_conversions` at `NumCPU()`, so the originally-drafted
-`-rate=200 -duration=5s` warm-up could not finish converting all 1000 images
-within 5 s (it landed around 700-750/1000) — this is a genuine compute
-ceiling, not a bug, so per the runbook's own rule the fix is to lower/slow
-the warm-up rate rather than weaken the "exactly 1000" acceptance check. If
-you run on a smaller machine, lower `-rate` and/or raise `-duration` further
-in `loadtest/run.sh`.
+1. **Warm-up** — every one of the 1000 images once, `-rate=100 -duration=15s`.
+   Each request is a cold fetch + convert, so the origin must end on exactly
+   1000.
+2. **Steady state** — the same 1000 images at the requested rate/duration.
+   After the warm-up they are all cached, so this phase is a ~100% cache-hit
+   latency measurement and the origin counter must not move.
+3. **Same-key burst** — 200 workers with `-rate=0` (as fast as they can) for
+   3 s against a single never-before-seen image, with the origin counter
+   reset first. This is the request-coalescing check: hundreds of concurrent
+   clients, one origin fetch.
+4. **Cache ceiling + CPU profile** — the disjoint 1001..2000 set at
+   `-rate=100 -duration=35s`, with a 30 s CPU profile captured into
+   `loadtest/cpu.pprof`. Every image here is new, so the profile captures a
+   miss-heavy (fetch + convert) phase, and the extra 1000 images push the
+   working set past the cache ceiling.
+
+The generated `loadtest/config.yaml` sets `cache.max_bytes` to **128 MiB**
+(`134217728`) and `GOMEMLIMIT=400MiB`. At ~93 KiB of WebP per image the 1000
+warm images are ~93 MiB and fit, which keeps phases 1-3 a clean "one fetch
+per image" / 100%-hit measurement; the full 2000-image working set is
+~186 MiB and does not fit, so phase 4 is where eviction happens and
+`ngax_cache_bytes` gets pinned at the ceiling. Sizing the cache below the
+warm set instead (e.g. 32 MiB) makes *every* phase miss-heavy and destroys
+the 100%-cache-hit latency evidence, which is why the ceiling is set to bind
+on the 2000-image set rather than the 1000-image one.
+
+The warm-up rate is tuned to this repo's 12-CPU dev/CI hardware:
+`-rate=100 -duration=15s`. Converting a fresh 512x512 PNG through libvips
+takes tens of ms even with `concurrency.max_conversions` at `NumCPU()`, so
+the originally-drafted `-rate=200 -duration=5s` warm-up could not finish
+converting all 1000 images within 5 s (it landed around 700-750/1000) — this
+is a genuine compute ceiling, not a bug, so per the runbook's own rule the
+fix is to lower/slow the warm-up rate rather than weaken the "exactly 1000"
+acceptance check. If you run on a smaller machine, lower `-rate` and/or
+raise `-duration` further in `loadtest/run.sh`.
 
 ## What to check
 
 | Output | Pass condition |
 |--------|----------------|
-| Origin fetch count after warm-up and after steady state | Exactly 1000 both times: one fetch per image, none repeated |
-| Origin fetch count during the profile phase | Exactly 1000: the disjoint 1001..2000 image set, each fetched once |
-| `ngax_coalesced_requests_total` | > 0 only when concurrent clients request the same cold image at once; the striped target file does not produce that, so 0 is expected here (coalescing is covered by `TestHandlerCoalescesConcurrentMisses`) |
-| vegeta `Success` | 100% |
-| vegeta latencies p99 (steady state, 90%+ hits) | < 20 ms on the target machine; cache-hit-only runs < 5 ms |
+| Origin fetch count after warm-up | Exactly 1000: one fetch per image, none repeated |
+| Origin fetch count after steady state | Still exactly 1000: the steady-state window fetched nothing |
+| `ngax_cache_misses_total` after steady state | 1000 — the warm-up's cold fetches and nothing else |
+| vegeta `Success` | 100% in every phase |
+| vegeta p99, steady state (100% hits) | < 5 ms |
 | `ngax_http_errors_total` | 0 |
-| VmRSS | Below GOMEMLIMIT (400 MiB in the script) and flat across repeated runs |
+| `ngax_cache_bytes` after steady state | <= `cache.max_bytes` (134217728), and roughly the size of the 1000 cached images |
+| VmRSS after steady state | Below `GOMEMLIMIT` (400 MiB in the script) and flat across repeated runs |
+| **Burst:** origin fetch count during the same-key burst | **1** — hundreds of concurrent clients on one cold image collapse to a single origin fetch. **2 is also correct**: ristretto admits the entry asynchronously, so a request arriving after the leader returned but before the `Set` is visible starts one more fetch. Anything larger means coalescing is broken |
+| **Burst:** `ngax_coalesced_requests_total` | **> 0**, and in practice ~`workers - 1` (199 of 200): every client but the leader waited on the in-flight fetch |
+| **Ceiling:** origin fetch count during the ceiling/profile phase | **>= 1000**. Exactly 1000 would mean nothing was evicted; above 1000 is the eviction signature, i.e. images dropped to stay under `max_bytes` and were fetched again |
+| **Ceiling:** `ngax_cache_bytes` after the ceiling phase | **<= 134217728**, and pressed right up against it — this is criterion 3: the cache is full and stays bounded |
+| **Ceiling:** VmRSS after the ceiling phase | Still below `GOMEMLIMIT`, no OOM |
 | CPU profile | Time is in `bimg`/libvips under `Converter.ToWebP` and in `net/http`; no `runtime.gcBgMarkWorker` dominating |
 
 ## Reading the profile
@@ -104,80 +131,122 @@ else's.
 
 ## Last run
 
-Command: `make image && sh loadtest/run.sh 1000 30s` (rate chosen modestly
-because the 12-core dev box also runs vegeta and the synthetic origin inside
-the same `docker run`; see the CPU note above for why the warm-up rate was
-lowered too).
+Command: `make image && sh loadtest/run.sh 1000 30s`, 2026-09-19. Rate chosen
+modestly because the 12-core dev box also runs vegeta and the synthetic origin
+inside the same `docker run`; see the CPU note above for why the warm-up rate
+was lowered too.
 
-- Origin fetch count after warm-up: **1000** (target: 1000)
-- Origin fetch count after steady state: **1000** (target: 1000, unchanged
-  — confirms zero duplicate/repeated origin fetches)
-- Origin fetch count during the profile phase (disjoint 1001..2000 image
-  set, counter reset beforehand): **1000** (target: 1000)
-- Warm-up (`-rate=100 -duration=15s`): 1500 requests issued (cycles back
-  over the 1000-image target list once all are cached), Success **100.00%**
-- Steady state (1000 rps, 30 s): 30000 requests, Success **100.00%**,
-  latencies p50 = 0.147 ms, p90 = 0.270 ms, p95 = 0.319 ms,
-  **p99 = 0.434 ms**, max = 3.288 ms
-- Profile phase (100 rps, 35 s, fresh 1000-image set): Success **100.00%**
-  (not shown in the printed report since that attack's output is discarded;
-  confirmed via the 1000/1000 origin count and zero `ngax_http_errors_total`
-  reported just before this phase started)
-- `ngax_cache_hits_total` delta over the run: 30500; `ngax_cache_misses_total`:
-  1000 (exactly the 1000 cold fetches from warm-up; the 1000 rps
-  steady-state window was 100% cache hits — the profile phase's 1000 misses
-  happen after this metrics snapshot is printed, so they aren't included in
-  these particular counter values)
-- `ngax_coalesced_requests_total`: 0 for this run — at 100 rps against 1000
-  distinct images, concurrent same-key misses are rare by construction, so
-  this run does not exercise the coalescing path (see
-  `TestHandlerCoalescesConcurrentMisses` in `handler_test.go` for a
-  concurrency-forcing test of that path instead)
-- `ngax_http_errors_total`: **0**
-- VmRSS: **206964 kB** (~202 MiB), well under the 400 MiB `GOMEMLIMIT` set
-  by the script
-- CPU profile (`loadtest/cpu.pprof`, 30 s during the **miss-heavy profile
-  phase** against the fresh 1001..2000 image set): `go tool pprof -top`
-  shows real conversion cost this time — top of profile is
-  `[libwebp.so.7.2.0]` at 94.23% flat, with `runtime.cgocall` (2.40%) and
-  `[libpng16.so.16.58.0]` (0.54%) next, and `main.(*Converter).ToWebP` /
-  `github.com/h2non/bimg.(*Image).Process` / `bimg.vipsSave` all present in
-  the cumulative call graph — this now matches the runbook's pass condition
-  ("time is in bimg/libvips under Converter.ToWebP"), unlike the earlier
-  cache-hit-only profile which was dominated by
-  `internal/runtime/syscall/linux.Syscall6` with no libvips/bimg frames at
-  all.
+**Phase 1 — warm-up** (`-rate=100 -duration=15s`)
 
-Fixes applied to `loadtest/run.sh` and `handler_bench_test.go` while
-producing this run (all in the committed files, not just this report):
+- 1500 requests issued (the target list cycles once all 1000 are cached),
+  Success **100.00%**, p99 88.9 ms (every request is a cold fetch+convert)
+- Origin fetch count: **1000** (target: exactly 1000)
+
+**Phase 2 — steady state** (1000 rps, 30 s, 100% cache hits)
+
+- 30000 requests, Success **100.00%**, latencies p50 = 0.146 ms,
+  p90 = 0.268 ms, p95 = 0.323 ms, **p99 = 0.433 ms**, max = 3.35 ms
+  (target: p99 < 5 ms)
+- Origin fetch count: **1000**, unchanged — zero duplicate origin fetches
+- `ngax_cache_hits_total` 30500, `ngax_cache_misses_total` **1000** (exactly
+  the warm-up's cold fetches), `ngax_http_errors_total` **0**
+- `ngax_cache_bytes`: **93 437 030** (~89 MiB, under the 128 MiB ceiling — the
+  1000 warm images fit, as designed)
+- VmRSS: **213 272 kB** (~208 MiB), well under the 400 MiB `GOMEMLIMIT`
+
+**Phase 3 — same-key burst** (200 workers, `-rate=0`, 3 s, one cold image,
+origin counter reset first)
+
+- 41323 requests in 3 s (**13 775 rps**), Success **100.00%**, p99 = 0.643 ms
+- Origin fetch count: **2** (target: 1). The first request coalesced 199
+  followers onto one fetch; the second fetch is the asynchronous-admission
+  window described in the table above — after the leader returned, its
+  singleflight entry was already gone while ristretto had not yet made the
+  cached entry visible, so one later request missed and fetched again. Both
+  runs of this phase produced exactly 2. It is not a coalescing failure:
+  199/200 of the concurrent clients were served from the single in-flight
+  fetch.
+- `ngax_coalesced_requests_total`: **199** (target: > 0) — was 0 before this
+  phase, so all 199 come from the burst
+
+**Phase 4 — cache ceiling + CPU profile** (1000 fresh images 1001..2000,
+100 rps, 35 s, origin counter reset first)
+
+- Origin fetch count: **2283** (target: >= 1000). The 1283 fetches above 1000
+  are the eviction signature: the 2000-image working set is ~186 MiB against a
+  128 MiB ceiling, so images were evicted and re-fetched.
+- `ngax_cache_bytes` after the phase: **134 217 338** against the
+  `cache.max_bytes` ceiling of **134 217 728** — 390 bytes of headroom. The
+  cache is completely full and stays bounded (criterion 3).
+- VmRSS after the phase: **325 744 kB** (~318 MiB), still under the 400 MiB
+  `GOMEMLIMIT`, no OOM
+- CPU profile (`loadtest/cpu.pprof`, 30 s, 112.99 s of samples at 376% CPU):
+  `go tool pprof -top` top line is **`106.52s 94.27% [libwebp.so.7.2.0]`**,
+  then `runtime.cgocall` 2.64%, `[libpng16.so.16.58.0]` 0.91%, with
+  `bimg.(*Image).Process` and `main.(*Converter).ToWebP` in the cumulative
+  graph — matching the pass condition ("time is in bimg/libvips under
+  `Converter.ToWebP`").
+
+### Notes on earlier fixes to this harness
 
 1. `BenchmarkCacheMiss` requested the same `/a.png` key from every parallel
    goroutine, so singleflight coalesced all of them onto one leader and the
    benchmark measured mostly wait time for a single shared conversion, not
    independent fetch+convert throughput. Fixed by giving each iteration a
    unique path (`/img-<n>.png` from an `atomic.Int64` counter). This changed
-   the measured numbers substantially (235034 ns/op → 822773 ns/op — see the
-   micro-benchmarks section above), which is expected: it's now measuring
+   the measured numbers substantially (235034 ns/op -> 822773 ns/op — see the
+   micro-benchmarks section above), which is expected: it is now measuring
    real independent work across all `NumCPU()` conversion workers instead of
    queueing behind one.
 2. The CPU profile was taken after the steady-state (cache-hit) phase, so it
    could never show libvips/bimg time. Fixed by adding a second, disjoint
    1000-image target file (`loadtest/targets-miss.txt`, ids 1001..2000),
-   resetting the origin's counter, and profiling a 35 s attack against that
-   fresh set instead — see the CPU profile bullet above for the resulting
-   (correct) profile shape.
-3. The final `wait` (no argument) waited on *every* background job,
-   including the long-running `ngax` and `origin` servers, which never exit
-   on their own — the script would hang forever before reaching the
-   `pkill` cleanup line. Fixed by capturing the profiling vegeta attack's
-   PID (`VPID=$!`) and waiting on that PID specifically.
-4. `pgrep -f /tmp/ngax` also matched the wrapping `sh -c "..."` process
-   (whose script text contains the literal string `/tmp/ngax`), so
-   `/proc/$(pgrep -f /tmp/ngax)/status` expanded to an invalid multi-PID
-   path and RSS reporting failed. Fixed with an anchored pattern,
-   `pgrep -f '^/tmp/ngax$'`, which matches only the exact command line of
-   the `ngax` process itself. The equivalent `pkill -f` pattern for
-   `origin` (which runs with `-addr`/`-size` args, so it can't be anchored
-   with a trailing `$`) is `'^/tmp/origin( |$)'`, anchored at the start and
-   requiring either a following space or end-of-string so it can't match
-   the wrapping shell's command line either.
+   resetting the origin's counter, and profiling an attack against that fresh
+   set instead.
+3. The final `wait` (no argument) waited on *every* background job, including
+   the long-running `ngax` and `origin` servers, which never exit on their
+   own — the script would hang forever before reaching the `pkill` cleanup
+   line. Fixed by capturing the profiling vegeta attack's PID (`VPID=$!`) and
+   waiting on that PID specifically.
+4. `pgrep -f /tmp/ngax` also matched the wrapping `sh -c "..."` process (whose
+   script text contains the literal string `/tmp/ngax`), so
+   `/proc/$(pgrep -f /tmp/ngax)/status` expanded to an invalid multi-PID path
+   and RSS reporting failed. Fixed with an anchored pattern,
+   `pgrep -f '^/tmp/ngax$'`. The equivalent `pkill -f` pattern for `origin`
+   (which runs with `-addr`/`-size` args, so it cannot be anchored with a
+   trailing `$`) is `'^/tmp/origin( |$)'`.
+5. The cache was originally sized at 256 MiB, larger than the whole
+   2000-image working set, so no phase ever exercised eviction. The ceiling
+   is now 128 MiB, which the 1000 warm images fit inside and the full
+   2000-image set does not — see the Run section for why it is not sized
+   below the warm set.
+
+## Follow-ups
+
+Not blocking the merge; recorded here so they are not lost.
+
+- **Hot-path allocations.** `BenchmarkCacheHit` sits at 22 allocs/op. Two easy
+  wins: cache the `Content-Length` string on `Entry` next to the ETag instead
+  of calling `strconv.Itoa(len(e.Data))` per response, and memoise the
+  Prometheus `(status, method)` children so `ServeHTTP`'s deferred block stops
+  doing two `WithLabelValues` map lookups per request.
+- **Per-server shutdown contexts.** `runServers` shares one 10 s context
+  across every `Shutdown`, so a slow public listener eats the budget of the
+  metrics and pprof servers. Give each its own deadline and shut them down in
+  parallel.
+- **Separate conversion deadline.** `produce` runs fetch and convert under one
+  `http_client.timeout_seconds + 5s` budget, so a slow origin can leave almost
+  no time for libvips. Give the conversion its own deadline.
+- **Pin the base images.** `Dockerfile`, `Dockerfile.dev` and the CI container
+  all use floating `golang:alpine` / `alpine`; pin them (e.g. `alpine:3.20`)
+  so a libvips or toolchain bump cannot silently change the numbers in this
+  runbook.
+- **No-cache requests do not skip coalescing.** A request carrying the
+  `nocache_header` still joins the singleflight group for its key, so it can
+  be served bytes produced by someone else's fetch. That is usually what you
+  want, but it is not what "no cache" says; decide and document, or give
+  bypass requests their own group key.
+- **`ServeMux` 301 redirects are invisible to metrics.** The stdlib mux
+  answers path-cleaning redirects (e.g. `/a//b.png` -> `/a/b.png`) itself,
+  before the image handler runs, so those responses never reach
+  `ngax_http_requests_total`. Wrap the mux if that traffic needs counting.
