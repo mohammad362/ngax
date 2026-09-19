@@ -34,6 +34,16 @@ for i in $(seq 1 1000); do
   echo "" >> "$ROOT/loadtest/targets.txt"
 done
 
+# A second, disjoint set of 1000 distinct images (never requested above) so
+# the CPU profile can be captured during a miss-heavy (fetch+convert) phase
+# instead of a fully-cached one.
+: > "$ROOT/loadtest/targets-miss.txt"
+for i in $(seq 1001 2000); do
+  echo "GET http://127.0.0.1:8080/img/$i.png" >> "$ROOT/loadtest/targets-miss.txt"
+  echo "Host: loadtest.local" >> "$ROOT/loadtest/targets-miss.txt"
+  echo "" >> "$ROOT/loadtest/targets-miss.txt"
+done
+
 docker run --rm -v "$ROOT":/app -v ngax-gocache:/root/.cache -v ngax-gomod:/go/pkg/mod -w /app ngax-dev sh -c "
   set -e
   go install github.com/tsenart/vegeta/v12@latest >/dev/null
@@ -51,12 +61,15 @@ docker run --rm -v "$ROOT":/app -v ngax-gocache:/root/.cache -v ngax-gomod:/go/p
   echo '== ngax metrics'
   wget -qO- --header 'Authorization: Basic bHQ6bHQ=' http://127.0.0.1:9080/metrics | grep -E '^ngax_(cache_hits_total|cache_misses_total|coalesced_requests_total|cache_bytes|http_errors_total) '
   echo '== RSS (KiB)'; grep VmRSS /proc/\$(pgrep -f '^/tmp/ngax\$')/status
-  echo '== 30s CPU profile -> loadtest/cpu.pprof'
-  vegeta attack -targets=loadtest/targets.txt -rate=${RATE} -duration=35s -max-workers=500 >/dev/null &
+  echo '== resetting origin counter for the profile phase'
+  wget -qO- http://127.0.0.1:9000/reset >/dev/null
+  echo '== 30s CPU profile during a miss-heavy phase (1000 new images) -> loadtest/cpu.pprof'
+  vegeta attack -targets=loadtest/targets-miss.txt -rate=100 -duration=35s -max-workers=500 >/dev/null &
   VPID=\$!
   wget -qO loadtest/cpu.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
   wait \$VPID
-  pkill -INT -f '^/tmp/ngax\$' || true; pkill -f '^/tmp/origin' || true
+  echo '== origin fetches during profile phase (expect 1000):'; wget -qO- http://127.0.0.1:9000/count
+  pkill -INT -f '^/tmp/ngax\$' || true; pkill -f '^/tmp/origin( |\$)' || true
 "
-rm -f "$ROOT/loadtest/config.yaml" "$ROOT/loadtest/targets.txt"
+rm -f "$ROOT/loadtest/config.yaml" "$ROOT/loadtest/targets.txt" "$ROOT/loadtest/targets-miss.txt"
 echo "Profile saved to loadtest/cpu.pprof; inspect with: make sh -> go tool pprof -top loadtest/cpu.pprof"

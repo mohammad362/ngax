@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -95,16 +97,20 @@ func BenchmarkCacheHit304(b *testing.B) {
 	})
 }
 
-// BenchmarkCacheMiss measures fetch + convert throughput with caching off.
+// BenchmarkCacheMiss measures independent fetch + convert throughput (unique
+// key per request, caching off). Each iteration requests a distinct path so
+// singleflight cannot coalesce concurrent goroutines onto one leader; the
+// origin serves the same PNG bytes regardless of path.
 func BenchmarkCacheMiss(b *testing.B) {
 	h, _ := benchHandler(b)
 	h.cfg.Cache.CacheEnabled = false
+	var n atomic.Int64
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		req := httptest.NewRequest(http.MethodGet, "/a.png", nil)
-		req.Host = "cdn.test"
 		for pb.Next() {
+			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/img-%d.png", n.Add(1)), nil)
+			req.Host = "cdn.test"
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {

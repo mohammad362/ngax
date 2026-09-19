@@ -5,3 +5,4 @@ main
 loadtest/cpu.pprof
 loadtest/config.yaml
 loadtest/targets.txt
+loadtest/targets-miss.txt
