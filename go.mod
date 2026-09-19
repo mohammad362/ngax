@@ -3,7 +3,6 @@ module ngAX
 go 1.24.0
 
 require (
-	github.com/gorilla/mux v1.8.1
 	github.com/h2non/bimg v1.1.9
 	// github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/sirupsen/logrus v1.9.3
@@ -13,7 +12,6 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/ristretto/v2 v2.4.2
-	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/prometheus/client_golang v1.17.0
 	golang.org/x/sync v0.3.0
 )
