@@ -61,6 +61,7 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 		{"http_server.port", c.HTTPServer.Port, 8080},
 		{"exporter.port", c.Exporter.Port, 9080},
 		{"log.level", c.Log.Level, "info"},
+		{"upstream_scheme", c.UpstreamScheme, "https://"},
 	}
 	for _, ck := range checks {
 		if ck.got != ck.want {
@@ -94,6 +95,14 @@ func TestLoadConfigRejectsBadQuality(t *testing.T) {
 	config = Config{}
 	if err := loadConfig(dir); err == nil {
 		t.Fatal("want error for quality 150, got nil")
+	}
+}
+
+func TestLoadConfigRejectsBadUpstreamScheme(t *testing.T) {
+	dir := writeConfig(t, minimalYAML+"upstream_scheme: \"ftp://\"\n")
+	config = Config{}
+	if err := loadConfig(dir); err == nil {
+		t.Fatal("want error for ftp:// scheme")
 	}
 }
 

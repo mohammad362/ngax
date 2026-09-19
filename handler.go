@@ -31,7 +31,7 @@ func NewHandler(cfg *Config, cache *ImageCache, fetcher *Fetcher, conv *Converte
 		fetcher:        fetcher,
 		conv:           conv,
 		log:            log,
-		upstreamScheme: "https://",
+		upstreamScheme: cfg.UpstreamScheme,
 	}
 }
 

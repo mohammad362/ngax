@@ -39,8 +39,9 @@ type Config struct {
 		IdleConnTimeout       int `mapstructure:"idle_conn_timeout"`
 		MaxIdleConnsPerHost   int `mapstructure:"max_idle_conns_per_host"`
 	} `mapstructure:"http_client"`
-	AllowedHosts map[string]string `mapstructure:"allowed_hosts"`
-	Limits       struct {
+	AllowedHosts   map[string]string `mapstructure:"allowed_hosts"`
+	UpstreamScheme string            `mapstructure:"upstream_scheme"` // "https://" (default) or "http://" for local testing
+	Limits         struct {
 		MaxImageBytes int64 `mapstructure:"max_image_bytes"`
 	} `mapstructure:"limits"`
 	Exporter struct {
@@ -138,6 +139,8 @@ func (c *Config) applyDefaults() {
 	setDefaultInt(&c.Exporter.Port, 9080)
 
 	setDefaultString(&c.Log.Level, "info")
+
+	setDefaultString(&c.UpstreamScheme, "https://")
 }
 
 func (c *Config) validate() error {
@@ -146,6 +149,9 @@ func (c *Config) validate() error {
 	}
 	if c.WebP.Quality < 1 || c.WebP.Quality > 100 {
 		return fmt.Errorf("webp.quality must be in 1..100, got %d", c.WebP.Quality)
+	}
+	if c.UpstreamScheme != "https://" && c.UpstreamScheme != "http://" {
+		return fmt.Errorf(`upstream_scheme must be "https://" or "http://", got %q`, c.UpstreamScheme)
 	}
 	return nil
 }
