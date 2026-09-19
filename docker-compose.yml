@@ -5,6 +5,13 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:9080:9080"
+    environment:
+      # Keep ~1.5x cache.max_bytes so the Go GC runs before the container limit.
+      GOMEMLIMIT: 1536MiB
+    deploy:
+      resources:
+        limits:
+          memory: 2g
     restart: on-failure
     volumes:
       - ./config.yaml:/app/config.yaml:ro

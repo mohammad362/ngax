@@ -1,9 +1,8 @@
 module ngAX
 
-go 1.21.4
+go 1.24.0
 
 require (
-	github.com/gorilla/mux v1.8.1
 	github.com/h2non/bimg v1.1.9
 	// github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/sirupsen/logrus v1.9.3
@@ -11,14 +10,16 @@ require (
 )
 
 require (
-	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/dgraph-io/ristretto/v2 v2.4.2
 	github.com/prometheus/client_golang v1.17.0
+	golang.org/x/sync v0.3.0
 )
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
@@ -39,7 +40,7 @@ require (
 	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.9.0 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
-	golang.org/x/sys v0.12.0 // indirect
+	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.13.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
