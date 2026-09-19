@@ -17,6 +17,8 @@ var initVips sync.Once
 type Converter struct {
 	sem      chan struct{}
 	lossless bool
+	// convert performs the actual encode; replaced in tests to observe concurrency.
+	convert func(src []byte, opts bimg.Options) ([]byte, error)
 }
 
 func NewConverter(workers int, lossless bool) *Converter {
@@ -33,7 +35,13 @@ func NewConverter(workers int, lossless bool) *Converter {
 		bimg.VipsCacheSetMax(0)
 		bimg.VipsCacheSetMaxMem(0)
 	})
-	return &Converter{sem: make(chan struct{}, workers), lossless: lossless}
+	return &Converter{
+		sem:      make(chan struct{}, workers),
+		lossless: lossless,
+		convert: func(src []byte, opts bimg.Options) ([]byte, error) {
+			return bimg.NewImage(src).Process(opts)
+		},
+	}
 }
 
 func (c *Converter) Workers() int { return cap(c.sem) }
@@ -47,7 +55,7 @@ func (c *Converter) ToWebP(ctx context.Context, src []byte, quality int) ([]byte
 	}
 	defer func() { <-c.sem }()
 
-	out, err := bimg.NewImage(src).Process(bimg.Options{
+	out, err := c.convert(src, bimg.Options{
 		Quality:  quality,
 		Lossless: c.lossless,
 		Type:     bimg.WEBP,

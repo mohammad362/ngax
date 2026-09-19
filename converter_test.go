@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/h2non/bimg"
 )
 
 func isWebP(b []byte) bool {
@@ -62,30 +64,37 @@ func TestToWebPHonoursContextWhileWaitingForWorker(t *testing.T) {
 func TestToWebPLimitsConcurrency(t *testing.T) {
 	c := NewConverter(2, false)
 	var inFlight, peak atomic.Int32
-	src := pngBytes(t)
+	c.convert = func(src []byte, _ bimg.Options) ([]byte, error) {
+		n := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		inFlight.Add(-1)
+		return []byte("RIFF....WEBP"), nil
+	}
 	var wg sync.WaitGroup
+	var failures atomic.Int32
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.sem <- struct{}{}
-			n := inFlight.Add(1)
-			for {
-				p := peak.Load()
-				if n <= p || peak.CompareAndSwap(p, n) {
-					break
-				}
+			if _, err := c.ToWebP(context.Background(), []byte("x"), 75); err != nil {
+				failures.Add(1)
 			}
-			time.Sleep(5 * time.Millisecond)
-			inFlight.Add(-1)
-			<-c.sem
 		}()
 	}
 	wg.Wait()
-	if peak.Load() > 2 {
-		t.Fatalf("semaphore admitted %d workers, want <= 2", peak.Load())
+	if failures.Load() != 0 {
+		t.Fatalf("%d conversions failed", failures.Load())
 	}
-	if _, err := c.ToWebP(context.Background(), src, 75); err != nil {
-		t.Fatal(err)
+	if peak.Load() > 2 {
+		t.Fatalf("ToWebP admitted %d concurrent conversions, want <= 2", peak.Load())
+	}
+	if peak.Load() < 2 {
+		t.Fatalf("expected the pool to reach 2 concurrent conversions, saw %d", peak.Load())
 	}
 }
