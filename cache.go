@@ -54,10 +54,13 @@ func NewImageCache(maxBytes int64, negativeTTL time.Duration) (*ImageCache, erro
 		NumCounters: counters,
 		MaxCost:     maxBytes,
 		BufferItems: 64,
-		Metrics:     false,
-		OnEvict: func(item *ristretto.Item[Entry]) {
-			cacheBytes.Sub(float64(item.Cost))
-		},
+		Metrics:     true,
+		// Without this, ristretto adds its own per-item storage overhead
+		// (sizeof its internal storeItem struct) to each item's cost, so
+		// CostAdded/CostEvicted would no longer equal the exact byte costs
+		// passed to Set. We want Bytes() to report exactly what callers
+		// pass in.
+		IgnoreInternalCost: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating image cache: %w", err)
@@ -81,13 +84,27 @@ func (c *ImageCache) Get(key string) (Entry, bool) {
 	return c.images.Get(key)
 }
 
-// Set stores e; the insert is asynchronous and may be dropped under
-// contention, which is acceptable for a cache.
+// Set stores e; the insert is applied by ristretto's background writer and
+// may be dropped under contention or rejected by the admission policy, which
+// is acceptable for a cache. cacheBytes is refreshed from ristretto's own
+// admitted-cost counters afterwards so it never drifts from what the cache
+// actually holds. Set waits for its own write to be applied first: ristretto
+// updates CostAdded/CostEvicted asynchronously, so reading Bytes() without
+// waiting would race the background writer and observe a stale, pre-item
+// value (confirmed empirically: 5/5 runs under-counted by exactly one item's
+// cost, not merely flaky).
 func (c *ImageCache) Set(key string, e Entry) {
 	cost := int64(len(e.Data))
-	if c.images.Set(key, e, cost) {
-		cacheBytes.Add(float64(cost))
-	}
+	c.images.Set(key, e, cost)
+	c.images.Wait()
+	cacheBytes.Set(float64(c.Bytes()))
+}
+
+// Bytes returns the approximate bytes of admitted entries: ristretto counts
+// cost only for items the admission policy accepted and subtracts it on eviction.
+func (c *ImageCache) Bytes() int64 {
+	m := c.images.Metrics
+	return int64(m.CostAdded()) - int64(m.CostEvicted())
 }
 
 func (c *ImageCache) GetNegative(key string) (int, bool) {

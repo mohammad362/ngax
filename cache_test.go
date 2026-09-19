@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func newTestCache(t *testing.T, maxBytes int64, negTTL time.Duration) *ImageCache {
@@ -88,6 +90,35 @@ func TestNegativeCacheDisabledWhenTTLZero(t *testing.T) {
 	c.Wait()
 	if _, ok := c.GetNegative("k"); ok {
 		t.Fatal("negative cache must be disabled when TTL is 0")
+	}
+}
+
+func TestCacheBytesReflectsAdmittedCost(t *testing.T) {
+	c := newTestCache(t, 1<<20, 0)
+	for i := 0; i < 3; i++ {
+		c.Set(fmt.Sprintf("k%d", i), NewEntry(make([]byte, 100)))
+	}
+	c.Wait()
+	c.Set("k3", NewEntry(make([]byte, 100))) // gauge is refreshed on Set
+	c.Wait()
+	if got := c.Bytes(); got != 400 {
+		t.Fatalf("want 400 admitted bytes, got %d", got)
+	}
+	if g := testutil.ToFloat64(cacheBytes); g != 400 {
+		t.Fatalf("gauge want 400, got %v", g)
+	}
+}
+
+func TestCacheBytesStaysUnderMaxAfterEvictions(t *testing.T) {
+	const max = 64 << 10
+	c := newTestCache(t, max, 0)
+	blob := make([]byte, 8<<10)
+	for i := 0; i < 64; i++ {
+		c.Set(fmt.Sprintf("k%d", i), NewEntry(blob))
+	}
+	c.Wait()
+	if got := c.Bytes(); got < 0 || got > max {
+		t.Fatalf("admitted bytes %d outside 0..%d", got, max)
 	}
 }
 
