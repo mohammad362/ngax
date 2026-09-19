@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"image"
-	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,19 +28,6 @@ func testConfig(t *testing.T) {
 	if err := setupRuntime(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func pngBytes(t *testing.T) []byte {
-	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
-	for i := range img.Pix {
-		img.Pix[i] = byte(i)
-	}
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
 }
 
 func TestHandleRequestRecordsActualStatusCode(t *testing.T) {

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -205,16 +204,6 @@ func writeWebP(w http.ResponseWriter, data []byte) {
 	w.Header().Set("Content-Type", "image/webp")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.Write(data)
-}
-
-func isSupportedImageFormat(contentType string) bool {
-	supportedFormats := []string{"jpeg", "jpg", "png", "gif", "bmp", "webp", "tiff"}
-	for _, format := range supportedFormats {
-		if strings.Contains(contentType, format) {
-			return true
-		}
-	}
-	return false
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
