@@ -43,13 +43,23 @@ func hostOnly(hostport string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
 }
 
+// methodLabel bounds the Prometheus method label to a fixed set.
+func methodLabel(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodHead:
+		return m
+	}
+	return "other"
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w}
 	defer func() {
 		code := strconv.Itoa(rec.Status())
-		requestsTotal.WithLabelValues(code, r.Method).Inc()
-		responseDuration.WithLabelValues(code, r.Method).Observe(time.Since(start).Seconds())
+		method := methodLabel(r.Method)
+		requestsTotal.WithLabelValues(code, method).Inc()
+		responseDuration.WithLabelValues(code, method).Observe(time.Since(start).Seconds())
 	}()
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -84,10 +94,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheMissesTotal.Inc()
 	}
 
+	leader := false
 	v, err, shared := h.group.Do(key, func() (any, error) {
+		leader = true
 		return h.produce(imageURL, quality)
 	})
-	if shared {
+	if shared && !leader {
 		coalescedTotal.Inc()
 	}
 	if err != nil {
@@ -135,6 +147,7 @@ func (h *Handler) produce(imageURL string, quality int) (Entry, error) {
 func (h *Handler) writeEntry(w http.ResponseWriter, r *http.Request, e Entry) {
 	hdr := w.Header()
 	hdr.Set("ETag", e.ETag)
+	hdr.Set("Vary", "x-webp-quality")
 	if cc := h.cfg.HTTPServer.CacheControl; cc != "" {
 		hdr.Set("Cache-Control", cc)
 	}

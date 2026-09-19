@@ -92,6 +92,9 @@ func TestHandlerServesWebPWithETagAndCacheControl(t *testing.T) {
 	if rec.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
 		t.Fatalf("Cache-Control %q", rec.Header().Get("Cache-Control"))
 	}
+	if rec.Header().Get("Vary") != "x-webp-quality" {
+		t.Fatalf("Vary %q", rec.Header().Get("Vary"))
+	}
 }
 
 func TestHandlerReturns304WhenETagMatches(t *testing.T) {
@@ -105,6 +108,9 @@ func TestHandlerReturns304WhenETagMatches(t *testing.T) {
 	}
 	if second.Body.Len() != 0 {
 		t.Fatal("304 must have empty body")
+	}
+	if second.Header().Get("Vary") != "x-webp-quality" {
+		t.Fatalf("304 Vary %q", second.Header().Get("Vary"))
 	}
 }
 
@@ -128,6 +134,7 @@ func TestHandlerCoalescesConcurrentMisses(t *testing.T) {
 	const clients = 50
 	var wg sync.WaitGroup
 	codes := make([]int, clients)
+	before := testutil.ToFloat64(coalescedTotal)
 	for i := 0; i < clients; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -145,6 +152,27 @@ func TestHandlerCoalescesConcurrentMisses(t *testing.T) {
 	}
 	if fx.fetches.Load() != 1 {
 		t.Fatalf("want exactly 1 origin fetch for %d concurrent clients, got %d", clients, fx.fetches.Load())
+	}
+	if delta := testutil.ToFloat64(coalescedTotal) - before; delta != clients-1 {
+		t.Fatalf("want %d coalesced followers, got %v", clients-1, delta)
+	}
+}
+
+func TestHandlerBoundsMethodLabel(t *testing.T) {
+	fx := newFixture(t)
+	before := testutil.ToFloat64(requestsTotal.WithLabelValues("405", "other"))
+	req := httptest.NewRequest("BOGUS", "/a.png", nil)
+	req.Host = "cdn.test"
+	rec := httptest.NewRecorder()
+	fx.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+	if testutil.ToFloat64(requestsTotal.WithLabelValues("405", "other"))-before != 1 {
+		t.Fatal("unknown method must be recorded under the fixed label \"other\"")
+	}
+	if testutil.ToFloat64(requestsTotal.WithLabelValues("405", "BOGUS")) != 0 {
+		t.Fatal("raw method token must never become a label value")
 	}
 }
 

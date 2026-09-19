@@ -185,6 +185,9 @@ func newHTTPClient(c *Config) *http.Client {
 // resolveQuality returns the WebP quality to use: the header value when it is
 // a valid integer in 1..100 (values above 100 are clamped), otherwise def.
 func resolveQuality(header string, def int) int {
+	if header == "" {
+		return def
+	}
 	q, err := strconv.Atoi(header)
 	if err != nil || q <= 0 {
 		return def
