@@ -1,0 +1,6 @@
+FROM golang:alpine
+RUN apk --no-cache add build-base vips-dev git
+ENV GOFLAGS=-mod=mod \
+    CGO_ENABLED=1 \
+    VIPS_CONCURRENCY=1
+WORKDIR /app
