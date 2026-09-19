@@ -159,6 +159,17 @@ func TestFetchHonoursContextWhileWaitingForSlot(t *testing.T) {
 	}
 }
 
+func TestShouldPoolRejectsOversizedBuffers(t *testing.T) {
+	small := bytes.NewBuffer(make([]byte, 0, 1024))
+	large := bytes.NewBuffer(make([]byte, 0, maxPooledBuffer+1))
+	if !shouldPool(small) {
+		t.Fatal("1 KiB buffer should be pooled")
+	}
+	if shouldPool(large) {
+		t.Fatal("buffer above maxPooledBuffer must not be pooled")
+	}
+}
+
 func TestIsSupportedImageFormat(t *testing.T) {
 	for ct, want := range map[string]bool{
 		"image/jpeg": true, "image/png": true, "image/gif": true, "image/webp": true,

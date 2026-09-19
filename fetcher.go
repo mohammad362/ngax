@@ -32,19 +32,18 @@ const maxPooledBuffer = 4 << 20
 type Body struct {
 	ContentType string
 	buf         *bytes.Buffer
-	pool        *sync.Pool
+	fetcher     *Fetcher
 }
 
+// Bytes aliases the pooled buffer; callers must not retain the slice after
+// Release.
 func (b *Body) Bytes() []byte { return b.buf.Bytes() }
 
 func (b *Body) Release() {
 	if b.buf == nil {
 		return
 	}
-	if b.buf.Cap() <= maxPooledBuffer {
-		b.buf.Reset()
-		b.pool.Put(b.buf)
-	}
+	b.fetcher.put(b.buf)
 	b.buf = nil
 }
 
@@ -105,17 +104,30 @@ func (f *Fetcher) Fetch(ctx context.Context, url string) (*Body, error) {
 	}
 	n, err := io.Copy(buf, io.LimitReader(resp.Body, f.maxBytes+1))
 	if err != nil {
-		buf.Reset()
-		f.pool.Put(buf)
+		f.put(buf)
 		return nil, fmt.Errorf("reading image body: %w", err)
 	}
 	if n > f.maxBytes {
-		buf.Reset()
-		f.pool.Put(buf)
+		f.put(buf)
 		return nil, fmt.Errorf("%w: body > %d bytes", ErrImageTooLarge, f.maxBytes)
 	}
 	totalImageSizeBeforeConversion.Add(float64(n))
-	return &Body{ContentType: contentType, buf: buf, pool: &f.pool}, nil
+	return &Body{ContentType: contentType, buf: buf, fetcher: f}, nil
+}
+
+// shouldPool reports whether a buffer is small enough to keep for reuse.
+func shouldPool(buf *bytes.Buffer) bool {
+	return buf.Cap() <= maxPooledBuffer
+}
+
+// put resets buf and returns it to the pool unless it has grown past
+// maxPooledBuffer, in which case it is left for the garbage collector.
+func (f *Fetcher) put(buf *bytes.Buffer) {
+	if !shouldPool(buf) {
+		return
+	}
+	buf.Reset()
+	f.pool.Put(buf)
 }
 
 func isSupportedImageFormat(contentType string) bool {
