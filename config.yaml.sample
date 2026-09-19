@@ -1,8 +1,10 @@
 # Configuration file for the image processing service
 
+# Map of accepted Host headers to the upstream origin that holds the images.
+# A request for http://example.com/a.jpg is fetched from https://images.example.com/a.jpg
 allowed_hosts:
-  - "example.com"
-  - "sub.exmaple1.com"
+  example.com: "images.example.com"
+  sub.example1.com: "images.example1.com"
 
 # WebP Image Processing Settings
 webp:
@@ -16,6 +18,10 @@ cache:
   cache_enabled: true
   nocache_header: "X-No-Cache" # You can change the header name as needed
   lru_cache: 300000
+
+# Upstream Limits
+limits:
+  max_image_bytes: 20971520         # Reject upstream images larger than this (bytes, default 20 MiB)
 
 # Concurrency Settings
 concurrency:

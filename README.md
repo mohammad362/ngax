@@ -1,108 +1,87 @@
-# Image Processing Service
+# ngAX — Image to WebP proxy
 
-This service provides an API for image processing, converting images to the WebP format, and caching them for efficient retrieval.
+ngAX is a small Go service that sits in front of an image origin, fetches the
+requested image over HTTPS, converts it to WebP with [libvips](https://www.libvips.org/)
+(via [bimg](https://github.com/h2non/bimg)), and caches the result in memory.
+
+The incoming `Host` header selects the upstream origin through the
+`allowed_hosts` map in `config.yaml`. Requests from hosts that are not listed
+are rejected with `403`.
+
+## Requirements
+
+- Go 1.21 or newer
+- libvips 8.x with development headers (`vips-dev` on Alpine, `libvips-dev` on Debian/Ubuntu)
+- Docker (optional, for containerised builds)
+
+## Configuration
+
+Copy `config.yaml.sample` to `config.yaml` and adjust it. The file is read from
+the working directory at start-up.
+
+| Section       | Key                | Purpose                                                        |
+|---------------|--------------------|----------------------------------------------------------------|
+| `allowed_hosts` | `<host>: <origin>` | Map of accepted `Host` headers to the upstream origin host      |
+| `webp`        | `quality`          | Default WebP quality (1-100)                                    |
+| `webp`        | `lossless`         | Use lossless WebP encoding                                      |
+| `cache`       | `cache_enabled`    | Enable the in-memory LRU cache                                  |
+| `cache`       | `nocache_header`   | Request header that bypasses the cache when set to `true`       |
+| `cache`       | `lru_cache`        | Maximum number of cached images                                 |
+| `limits`      | `max_image_bytes`  | Reject upstream images larger than this (default 20 MiB)        |
+| `concurrency` | `max_goroutines`   | Maximum number of concurrent conversions                        |
+| `http_client` | `*`                | Timeouts for upstream fetches, in seconds                       |
+| `http_server` | `bind_ip`, `port`  | Public listener                                                 |
+| `exporter`    | `bind_ip`, `port`, `user`, `password` | Prometheus `/metrics` listener, protected by basic auth |
+
+## Running
+
+```bash
+cp config.yaml.sample config.yaml
+go run .
+```
+
+Or with Docker Compose, which pulls the published image:
+
+```bash
+docker compose up
+```
+
+## Endpoints
+
+| Listener            | Path        | Description                                          |
+|---------------------|-------------|------------------------------------------------------|
+| `http_server`       | `/<path>`   | Fetches `https://<origin>/<path>` and returns WebP    |
+| `http_server`       | `/health`   | Returns `OK`                                         |
+| `exporter`          | `/metrics`  | Prometheus metrics (basic auth)                      |
+| `localhost:6060`    | `/debug/pprof/` | Go profiling, local machine only                 |
+
+Per-request options:
+
+- `x-webp-quality: <1-100>` overrides the configured quality for that request.
+- `<nocache_header>: true` bypasses the cache for that request.
+
+Example:
+
+```bash
+curl -H 'Host: example.com' http://localhost:8080/images/photo.jpg -o photo.webp
+```
 
 ## Development
 
-### Prerequisites
+```bash
+go vet ./...
+go test ./...
+```
 
-- Go 1.18 or higher
-- Docker and Docker Compose (for containerization and local testing)
-- An understanding of Go modules and HTTP server handling
+`stress-test/test.go` is a standalone load generator; edit the constants at the
+top before running it with `go run ./stress-test`.
 
-### Setting Up Your Development Environment
+## Building
 
-1. **Clone the Repository:**
+```bash
+go build -o ngax .
+docker build -t ngax .
+```
 
-   ```bash
-   git clone [repository URL]
-   cd my-image-service
-   ```
-
-2. **Install Dependencies:**
-
-   The project uses Go modules for dependency management.
-
-   ```bash
-   go mod tidy
-   ```
-
-3. **Environment Variables:**
-
-   Set the necessary environment variables (e.g., `API_SECRET`). You can do this by exporting them in your shell or by setting them in a `.env` file at the root of the project.
-
-4. **Running the Application Locally:**
-
-   To run the service locally:
-
-   ```bash
-   go run ./cmd/server/main.go
-   ```
-
-   This will start the server on `localhost:8080` (or another port, if configured).
-
-## Building the Application
-
-1. **Building a Binary:**
-
-   Compile the application into a binary:
-
-   ```bash
-   go build -o image-service ./cmd/server
-   ```
-
-2. **Building a Docker Image:**
-
-   Use the provided `Dockerfile` to build a Docker image:
-
-   ```bash
-   docker build -t image-service .
-   ```
-
-3. **Using Docker Compose:**
-
-   Alternatively, use Docker Compose to build and run the service:
-
-   ```bash
-   docker-compose up --build
-   ```
-
-## Usage
-
-After starting the service, you can interact with it via HTTP requests:
-
-1. **Convert an Image to WebP:**
-
-   Send a request to the service with the image URL:
-
-   ```bash
-   curl http://localhost:8080/path/to/image
-   ```
-
-   The server will return the WebP converted image.
-
-2. **Health Check:**
-
-   To check the health of the service:
-
-   ```bash
-   curl http://localhost:8080/health
-   ```
-
-## Additional Information
-
-- **Configuration:** See `configs/config.yaml` for configuration options.
-- **Logging:** The service uses `logrus` for logging. Logs are output in JSON format.
-- **Caching:** Cached images are stored temporarily as defined in the configuration.
-
-## Contributing
-
-Contributions to this project are welcome. Please adhere to the project's coding standards and submit pull requests for any new features or bug fixes.
-
-## License
-
-[Specify the license here]
-
----
-
-For more information, please refer to the in-depth documentation in the `/docs` directory.
+Pushes to `master` and `v*` tags are built and published to
+`ghcr.io/mohammad362/ngax/ngax` by GitHub Actions.

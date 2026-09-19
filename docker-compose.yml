@@ -1,21 +1,15 @@
-version: '3.8'
-
 services:
   image_processing:
-    image: ghcr.io/mohammad362/ngax/ngax
+    image: ghcr.io/mohammad362/ngax/ngax:latest
     container_name: image_processing
     ports:
       - "127.0.0.1:8080:8080"
-      - "9080:9080"
-    environment:
-      - GIN_MODE=release
+      - "127.0.0.1:9080:9080"
     restart: on-failure
     volumes:
-      - ./config.yaml:/app/config.yaml
+      - ./config.yaml:/app/config.yaml:ro
     logging:
       driver: "json-file"
       options:
         max-size: 10m
         max-file: "1"
-        
-

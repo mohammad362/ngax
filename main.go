@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"io"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -47,7 +47,10 @@ type Config struct {
 		ExpectContinueTimeout int `mapstructure:"expect_continue_timeout"`
 	} `mapstructure:"http_client"`
 	AllowedHosts map[string]string `mapstructure:"allowed_hosts"`
-	Exporter     struct {
+	Limits       struct {
+		MaxImageBytes int64 `mapstructure:"max_image_bytes"`
+	} `mapstructure:"limits"`
+	Exporter struct {
 		BindIP   string `mapstructure:"bind_ip"`
 		Port     int    `mapstructure:"port"`
 		User     string `mapstructure:"user"`
@@ -59,10 +62,11 @@ type Config struct {
 	} `mapstructure:"http_server"`
 }
 
-type ImageResult struct {
-	Data  []byte
-	Error error
-}
+// defaultMaxImageBytes caps the size of an upstream image when limits.max_image_bytes is unset.
+const defaultMaxImageBytes = 20 << 20
+
+// upstreamScheme is the scheme used for upstream fetches; overridden in tests.
+var upstreamScheme = "https://"
 
 var (
 	requestsTotal = prometheus.NewCounterVec(
@@ -126,7 +130,7 @@ var (
 
 	config     Config
 	imgCache   *lru.TwoQueueCache[string, []byte]
-	logger     *logrus.Logger
+	logger     = newLogger()
 	httpClient *http.Client
 	semaphore  chan struct{}
 )
@@ -140,204 +144,217 @@ func init() {
 	prometheus.MustRegister(totalImageSizeBeforeConversion)
 	prometheus.MustRegister(totalImageSizeAfterConversion)
 	prometheus.MustRegister(invalidHostsCount)
+}
 
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	if err := viper.ReadInConfig(); err != nil {
-		logrus.Fatalf("Error reading config file: %v", err)
+func newLogger() *logrus.Logger {
+	l := logrus.New()
+	l.Out = os.Stdout
+	l.Level = logrus.DebugLevel
+	l.Formatter = &logrus.JSONFormatter{}
+	return l
+}
+
+// loadConfig reads config.yaml from dir into the global config.
+func loadConfig(dir string) error {
+	// Hostnames are map keys in allowed_hosts, so the default "." key
+	// delimiter must not be used or viper would split them into nested maps.
+	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(dir)
+	if err := v.ReadInConfig(); err != nil {
+		return fmt.Errorf("reading config file: %w", err)
 	}
-
-	if err := viper.Unmarshal(&config); err != nil {
-		logrus.Fatalf("Unable to decode into struct: %v", err)
+	if err := v.Unmarshal(&config); err != nil {
+		return fmt.Errorf("decoding config: %w", err)
 	}
+	return nil
+}
 
+// setupRuntime builds the cache, HTTP client and semaphore from the loaded config.
+func setupRuntime() error {
 	var err error
-	imgCache, err = lru.New2Q[string, []byte](config.Cache.LruCache) // Size of the cache
+	imgCache, err = lru.New2Q[string, []byte](config.Cache.LruCache)
 	if err != nil {
-		logrus.Fatalf("Failed to create ARCCache: %v", err)
+		return fmt.Errorf("creating cache: %w", err)
 	}
-
-	logger = logrus.New()
-	logger.Out = os.Stdout
-	logger.Level = logrus.DebugLevel
-	logger.Formatter = &logrus.JSONFormatter{}
 
 	httpClient = &http.Client{
 		Transport: &http.Transport{
-			Dial: (&net.Dialer{
+			DialContext: (&net.Dialer{
 				Timeout:   time.Duration(config.HTTPClient.DialTimeoutSeconds) * time.Second,
 				KeepAlive: time.Duration(config.HTTPClient.KeepAlive) * time.Second,
-			}).Dial,
+			}).DialContext,
 			TLSHandshakeTimeout:   time.Duration(config.HTTPClient.TLSHandshakeTimeout) * time.Second,
 			ResponseHeaderTimeout: time.Duration(config.HTTPClient.ResponseHeaderTimeout) * time.Second,
 			ExpectContinueTimeout: time.Duration(config.HTTPClient.ExpectContinueTimeout) * time.Second,
-			MaxConnsPerHost:       0,
-			MaxIdleConnsPerHost:   0,
 			MaxIdleConns:          100,
 		},
 		Timeout: time.Second * time.Duration(config.HTTPClient.TimeoutSeconds),
 	}
 
+	if config.Concurrency.MaxGoroutines <= 0 {
+		config.Concurrency.MaxGoroutines = 1
+	}
 	semaphore = make(chan struct{}, config.Concurrency.MaxGoroutines)
+	if config.Limits.MaxImageBytes <= 0 {
+		config.Limits.MaxImageBytes = defaultMaxImageBytes
+	}
+	return nil
 }
 
 func main() {
-	router := mux.NewRouter()
-	metricsRouter := mux.NewRouter()
-	router.HandleFunc("/{image:.*}", handleRequest)
-	router.HandleFunc("/health", healthCheckHandler)
-	metricsRouter.Handle("/metrics", prometheusHandler())
+	if err := loadConfig("."); err != nil {
+		logger.Fatal(err)
+	}
+	if err := setupRuntime(); err != nil {
+		logger.Fatal(err)
+	}
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("%v:%v", config.HTTPServer.BindIP, config.HTTPServer.Port),
-		Handler: router,
+		Handler: newRouter(),
 	}
 
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-
-	go func() {
-		logger.Info(fmt.Sprintf("Server started at http://%v:%v", config.HTTPServer.BindIP, config.HTTPServer.Port))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("ListenAndServe(): %v", err)
-		}
-	}()
-
+	metricsRouter := mux.NewRouter()
+	metricsRouter.Handle("/metrics", promhttp.Handler())
 	metricsSrv := &http.Server{
 		Addr:    fmt.Sprintf("%v:%v", config.Exporter.BindIP, config.Exporter.Port),
 		Handler: basicAuthMiddleware(metricsRouter),
 	}
 
-	go func() {
-		logger.Info(fmt.Sprintf("Exporter started at http://%v:%v", config.Exporter.BindIP, config.Exporter.Port))
-		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("ListenAndServe(): %v", err)
-		}
-	}()
+	// pprof is registered on the default mux by the net/http/pprof import and
+	// is only reachable from the local machine.
+	pprofSrv := &http.Server{Addr: "localhost:6060", Handler: http.DefaultServeMux}
 
-	gracefulShutdown(srv)
+	errChan := make(chan error, 3)
+	serve := func(name string, s *http.Server) {
+		logger.Infof("%s listening on http://%s", name, s.Addr)
+		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	go serve("server", srv)
+	go serve("exporter", metricsSrv)
+	go serve("pprof", pprofSrv)
+
+	gracefulShutdown(errChan, srv, metricsSrv, pprofSrv)
+}
+
+// newRouter builds the public router. Fixed routes are registered before the
+// catch-all so they are never subject to the host allowlist.
+func newRouter() *mux.Router {
+	router := mux.NewRouter()
+	router.HandleFunc("/health", healthCheckHandler)
+	router.HandleFunc("/{image:.*}", handleRequest)
+	return router
+}
+
+// statusRecorder captures the status code written by a handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	rec := &statusRecorder{ResponseWriter: w}
+	defer func() {
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		code := strconv.Itoa(rec.status)
+		requestsTotal.WithLabelValues(code, r.Method).Inc()
+		responseDuration.WithLabelValues(code, r.Method).Observe(time.Since(startTime).Seconds())
+	}()
+
 	remoteHost := r.Host
-
-	if r.URL.Path == "/metrics" {
-		// Allow unrestricted access to the /metrics endpoint
-		prometheusHandler().ServeHTTP(w, r)
-		return
-	}
-	if r.URL.Path == "/health" {
-		// Allow unrestricted access to the /health endpoint
-		healthCheckHandler(w, r)
-		return
-	}
-
 	if remoteHost == "" {
-		http.Error(w, "Host header is missing", http.StatusBadRequest)
+		http.Error(rec, "Host header is missing", http.StatusBadRequest)
 		return
 	}
 
-	statusCode := strconv.Itoa(http.StatusOK)
-	duration := time.Since(startTime).Seconds()
-
-	requestsTotal.WithLabelValues(statusCode, r.Method).Inc()
-	responseDuration.WithLabelValues(statusCode, r.Method).Observe(duration)
-
-	// Check if the remote host is allowed and get the corresponding imageURL host
+	// Map the incoming host to the upstream host that actually holds the image.
 	allowedHost, exists := config.AllowedHosts[remoteHost]
 	if !exists {
 		invalidHostsCount.Inc()
 		logger.Warn("Unauthorized access attempt from host: ", remoteHost)
-		http.Error(w, "Host not allowed", http.StatusForbidden)
+		http.Error(rec, "Host not allowed", http.StatusForbidden)
 		return
 	}
 
-	cacheCount := imgCache.Len()
-	logger.Info("Cache element count: ", cacheCount)
+	imageURL := buildImageURL(allowedHost, r.URL.Path, r.URL.RawQuery)
 
-	imageURL := "https://" + allowedHost + r.URL.Path //+ "?" + r.URL.RawQuery
-
-	nocacheHeader := r.Header.Get(config.Cache.NoCacheHeader)
-	if config.Cache.CacheEnabled && nocacheHeader != "true" {
+	useCache := config.Cache.CacheEnabled && r.Header.Get(config.Cache.NoCacheHeader) != "true"
+	if useCache {
 		if cachedImage, found := imgCache.Get(imageURL); found {
-			logger.Info("Cache hit for URL: ", imageURL)
-			serveCachedImage(w, cachedImage)
+			logger.Debug("Cache hit for URL: ", imageURL)
 			cacheHitsTotal.Inc()
+			writeWebP(rec, cachedImage)
 			return
 		}
 		cacheMissesTotal.Inc()
+		logger.Debug("Cache miss for URL: ", imageURL)
 	}
 
-	logger.Info("Cache miss for URL: ", imageURL)
-
 	semaphoreWaitStart := time.Now()
-	logger.Info("Waiting for semaphore slot")
 	semaphore <- struct{}{}
 	defer func() { <-semaphore }()
-	semaphoreWaitDuration := time.Since(semaphoreWaitStart)
 	logger.WithFields(logrus.Fields{
-		"semaphoreWaitDuration": semaphoreWaitDuration,
-	}).Info("Semaphore slot acquired")
+		"semaphoreWaitDuration": time.Since(semaphoreWaitStart),
+	}).Debug("Semaphore slot acquired")
 
-	resultChan := make(chan ImageResult)
-	go processImageAsync(imageURL, resultChan, r)
-
-	result := <-resultChan
-	if result.Error != nil {
-		logger.WithFields(logrus.Fields{"error": result.Error.Error(), "url": imageURL}).Error("Error processing image")
-		http.Error(w, fmt.Sprintf("Error processing image: %v", result.Error), http.StatusInternalServerError)
+	quality := resolveQuality(r.Header.Get("x-webp-quality"), config.WebP.Quality)
+	newImage, err := fetchAndConvert(imageURL, quality)
+	if err != nil {
+		logger.WithFields(logrus.Fields{"error": err.Error(), "url": imageURL}).Error("Error processing image")
+		http.Error(rec, "Error processing image", http.StatusBadGateway)
 		errorsTotal.Inc()
 		return
 	}
 
-	w.Header().Set("Content-Type", "image/webp")
-	w.Header().Set("Content-Length", strconv.Itoa(len(result.Data)))
-	w.Write(result.Data)
+	if useCache {
+		imgCache.Add(imageURL, newImage)
+	}
+	writeWebP(rec, newImage)
 }
 
-func processImageAsync(imageURL string, resultChan chan ImageResult, req *http.Request) {
-
-	var quality int
-
-	// Check if x-webp-quality header is provided in the request
-	if qualityHeader := req.Header.Get("x-webp-quality"); qualityHeader != "" {
-		if q, err := strconv.Atoi(qualityHeader); err == nil {
-			quality = q
-		}
-	}
-
-	// Use default quality from config if x-webp-quality header is not provided or invalid
-	if quality == 0 {
-		quality = config.WebP.Quality
-	}
-
+// fetchAndConvert downloads imageURL and converts it to WebP at the given quality.
+func fetchAndConvert(imageURL string, quality int) ([]byte, error) {
 	resp, err := httpClient.Get(imageURL)
 	if err != nil {
-		resultChan <- ImageResult{Error: err}
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		resultChan <- ImageResult{Error: fmt.Errorf("HTTP error from remote host: %s", resp.Status)}
-		return
+		return nil, fmt.Errorf("HTTP error from remote host: %s", resp.Status)
 	}
 
-	contentType := resp.Header.Get("Content-Type")
-	if !isSupportedImageFormat(contentType) {
-		resultChan <- ImageResult{Error: fmt.Errorf("Unsupported image format")}
-		return
+	if !isSupportedImageFormat(resp.Header.Get("Content-Type")) {
+		return nil, fmt.Errorf("unsupported image format %q", resp.Header.Get("Content-Type"))
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	limit := config.Limits.MaxImageBytes
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		resultChan <- ImageResult{Error: fmt.Errorf("Error reading image body: %v", err)}
-		return
+		return nil, fmt.Errorf("reading image body: %w", err)
 	}
-	// Calculate the size of the original image
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("image exceeds size limit of %d bytes", limit)
+	}
 	totalImageSizeBeforeConversion.Add(float64(len(body)))
 
 	options := bimg.Options{
@@ -345,32 +362,22 @@ func processImageAsync(imageURL string, resultChan chan ImageResult, req *http.R
 		Lossless: config.WebP.Lossless,
 		Type:     bimg.WEBP,
 	}
-
 	newImage, err := bimg.NewImage(body).Process(options)
-	totalImageSizeAfterConversion.Add(float64(len(newImage)))
 	if err != nil {
-		resultChan <- ImageResult{Error: fmt.Errorf("Error converting image: %v", err)}
-		return
+		return nil, fmt.Errorf("converting image: %w", err)
 	}
-
-	imgCache.Add(imageURL, newImage)
-
-	resultChan <- ImageResult{Data: newImage}
+	totalImageSizeAfterConversion.Add(float64(len(newImage)))
+	return newImage, nil
 }
 
-func serveCachedImage(w http.ResponseWriter, cachedImageData interface{}) {
-	if imageData, ok := cachedImageData.([]byte); ok {
-		w.Header().Set("Content-Type", "image/webp")
-		w.Header().Set("Content-Length", strconv.Itoa(len(imageData)))
-		w.Write(imageData)
-	} else {
-		logger.Error("Invalid data type found in cache")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
+func writeWebP(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", "image/webp")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }
 
 func isSupportedImageFormat(contentType string) bool {
-	supportedFormats := []string{"jpeg", "jpg", "png", "gif", "bmp"}
+	supportedFormats := []string{"jpeg", "jpg", "png", "gif", "bmp", "webp", "tiff"}
 	for _, format := range supportedFormats {
 		if strings.Contains(contentType, format) {
 			return true
@@ -384,48 +391,61 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func gracefulShutdown(srv *http.Server) {
+// gracefulShutdown waits for a termination signal or a listener failure, then
+// drains every server before returning.
+func gracefulShutdown(errChan <-chan error, servers ...*http.Server) {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
-	<-stopChan
-	logger.Info("Shutting down server...")
+	select {
+	case sig := <-stopChan:
+		logger.Infof("Received %s, shutting down...", sig)
+	case err := <-errChan:
+		logger.Errorf("Listener failed: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Fatalf("Server forced to shutdown: %v", err)
-	}
-
-	logger.Info("Server gracefully stopped")
-}
-
-func isAllowedHost(host string) bool {
-	for _, allowedHost := range config.AllowedHosts {
-		if host == allowedHost {
-			return true
+	for _, s := range servers {
+		if err := s.Shutdown(ctx); err != nil {
+			logger.Errorf("Forced shutdown of %s: %v", s.Addr, err)
 		}
 	}
-	return false
-}
-
-func prometheusHandler() http.Handler {
-	return promhttp.Handler()
+	logger.Info("Servers stopped")
 }
 
 func basicAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		username := config.Exporter.User
-		password := config.Exporter.Password
-
 		user, pass, ok := r.BasicAuth()
-		if !ok || user != username || pass != password {
+		if !ok || user != config.Exporter.User || pass != config.Exporter.Password {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
+}
+
+// resolveQuality returns the WebP quality to use: the header value when it is
+// a valid integer in 1..100 (values above 100 are clamped), otherwise def.
+func resolveQuality(header string, def int) int {
+	q, err := strconv.Atoi(header)
+	if err != nil || q <= 0 {
+		return def
+	}
+	if q > 100 {
+		return 100
+	}
+	return q
+}
+
+// buildImageURL builds the upstream URL, keeping the query string so that
+// distinct variants of an image are fetched and cached separately.
+func buildImageURL(host, path, rawQuery string) string {
+	u := upstreamScheme + host + path
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return u
 }

@@ -11,6 +11,7 @@ const (
 	testImagePath = "image_path"             // Replace with a valid image path
 	numRequests   = 10000                    // Total number of requests to send
 	concurrency   = 150                      // Number of concurrent requests
+	hostHeader    = "cdn.example.com"        // Replace with a host from allowed_hosts
 )
 
 func main() {
@@ -24,7 +25,6 @@ func main() {
 			defer wg.Done()
 			// Append a unique query parameter to bypass the cache
 			imageURL := fmt.Sprintf("%s%s?nocache=%d", baseURL, testImagePath, i)
-			fmt.Printf("%s", imageURL)
 			// Create a new HTTP request
 			req, err := http.NewRequest("GET", imageURL, nil)
 			if err != nil {
@@ -34,7 +34,7 @@ func main() {
 			}
 
 			// Set the Host header to match the expected host from the whitelist
-			req.Host = "cdn.ilna.ir" // Replace with the actual whitelisted host
+			req.Host = hostHeader
 
 			// Send the request
 			resp, err := http.DefaultClient.Do(req)
