@@ -2,3 +2,6 @@ config.yaml
 ngax
 main
 .superpowers/
+loadtest/cpu.pprof
+loadtest/config.yaml
+loadtest/targets.txt
