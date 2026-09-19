@@ -25,7 +25,9 @@ type Config struct {
 		LruCache           int    `mapstructure:"lru_cache"` // deprecated, ignored
 	} `mapstructure:"cache"`
 	Concurrency struct {
-		MaxGoroutines  int `mapstructure:"max_goroutines"` // deprecated alias of max_conversions
+		// MaxGoroutines is kept only so an old config.yaml still decodes; it
+		// is deprecated and ignored (main warns about it at start-up).
+		MaxGoroutines  int `mapstructure:"max_goroutines"`
 		MaxConversions int `mapstructure:"max_conversions"`
 		MaxFetches     int `mapstructure:"max_fetches"`
 	} `mapstructure:"concurrency"`
@@ -112,9 +114,6 @@ func (c *Config) applyDefaults() {
 		c.Cache.NegativeTTLSeconds = 30
 	}
 
-	if c.Concurrency.MaxConversions <= 0 && c.Concurrency.MaxGoroutines > 0 {
-		c.Concurrency.MaxConversions = c.Concurrency.MaxGoroutines
-	}
 	setDefaultInt(&c.Concurrency.MaxConversions, runtime.NumCPU())
 	setDefaultInt(&c.Concurrency.MaxFetches, 512)
 
@@ -156,6 +155,23 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// isLoopbackBind reports whether a bind address only accepts connections
+// from the local machine. "localhost" is treated as loopback; an empty or
+// unparseable value (0.0.0.0, ::, a NIC address, a name) is not.
+func isLoopbackBind(ip string) bool {
+	if ip == "localhost" {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
+}
+
+// exporterUnauthenticatedOnPublicBind reports whether /metrics is reachable
+// from outside this machine with no basic-auth credentials configured.
+func (c *Config) exporterUnauthenticatedOnPublicBind() bool {
+	return !isLoopbackBind(c.Exporter.BindIP) && (c.Exporter.User == "" || c.Exporter.Password == "")
+}
+
 // NegativeTTL is how long origin 404s are remembered. The YAML default is
 // 30 s; a negative value disables it (0 is indistinguishable from "unset").
 func (c *Config) NegativeTTL() time.Duration {
@@ -165,11 +181,28 @@ func (c *Config) NegativeTTL() time.Duration {
 	return time.Duration(c.Cache.NegativeTTLSeconds) * time.Second
 }
 
+// distinctOrigins counts the distinct upstream origins in the allowlist
+// (several Host headers may map to the same one). It never returns less
+// than 1, so the idle pool is sized sanely for an empty map too.
+func distinctOrigins(hosts map[string]string) int {
+	seen := make(map[string]struct{}, len(hosts))
+	for _, origin := range hosts {
+		seen[origin] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return 1
+	}
+	return len(seen)
+}
+
 // newHTTPClient builds the upstream client. The service talks to a handful
 // of origin hosts, so the idle pool per host is the main lever against
-// connection churn.
+// connection churn. MaxIdleConns is a *global* cap: sizing it at the
+// per-host value would let one busy origin starve the others, so it scales
+// with the number of distinct origins in the allowlist.
 func newHTTPClient(c *Config) *http.Client {
 	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
+	origins := distinctOrigins(c.AllowedHosts)
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{
@@ -181,7 +214,7 @@ func newHTTPClient(c *Config) *http.Client {
 			ResponseHeaderTimeout: sec(c.HTTPClient.ResponseHeaderTimeout),
 			ExpectContinueTimeout: sec(c.HTTPClient.ExpectContinueTimeout),
 			IdleConnTimeout:       sec(c.HTTPClient.IdleConnTimeout),
-			MaxIdleConns:          c.HTTPClient.MaxIdleConnsPerHost,
+			MaxIdleConns:          c.HTTPClient.MaxIdleConnsPerHost * origins,
 			MaxIdleConnsPerHost:   c.HTTPClient.MaxIdleConnsPerHost,
 		},
 		Timeout: sec(c.HTTPClient.TimeoutSeconds),

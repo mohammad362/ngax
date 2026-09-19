@@ -26,6 +26,12 @@ func NewConverter(workers int, lossless bool) *Converter {
 		workers = 1
 	}
 	initVips.Do(func() {
+		// bimg's own package init() already runs Initialize() and sets the
+		// vips concurrency to 1 when VIPS_CONCURRENCY is unset, so by the
+		// time this runs libvips is configured. The Setenv below is
+		// therefore belt and braces for a future bimg that stops doing
+		// that; the operative setting for deployments is the ENV in the
+		// Dockerfile, which is in place before the process starts.
 		if os.Getenv("VIPS_CONCURRENCY") == "" {
 			os.Setenv("VIPS_CONCURRENCY", "1")
 		}

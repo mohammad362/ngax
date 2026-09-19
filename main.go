@@ -12,6 +12,12 @@ func main() {
 	if config.Cache.LruCache != 0 {
 		log.Warn("cache.lru_cache is deprecated and ignored; use cache.max_bytes")
 	}
+	if config.Concurrency.MaxGoroutines != 0 {
+		log.Warn("concurrency.max_goroutines is deprecated and ignored; conversions default to the CPU count, see concurrency.max_conversions")
+	}
+	if config.exporterUnauthenticatedOnPublicBind() {
+		log.Warnf("exporter.bind_ip is %q (not loopback) but exporter.user/password are not both set: /metrics is exposed without authentication", config.Exporter.BindIP)
+	}
 
 	cache, err := NewImageCache(config.Cache.MaxBytes, config.NegativeTTL())
 	if err != nil {

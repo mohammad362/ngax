@@ -37,6 +37,11 @@ func NewHandler(cfg *Config, cache *ImageCache, fetcher *Fetcher, conv *Converte
 
 // hostOnly strips an optional :port from a Host header value.
 func hostOnly(hostport string) string {
+	// Fast path for the common "no port" case: SplitHostPort would allocate
+	// an *net.AddrError on the heap for every such request.
+	if strings.IndexByte(hostport, ':') < 0 {
+		return hostport
+	}
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
 		return h
 	}
@@ -76,7 +81,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	quality := resolveQuality(r.Header.Get("x-webp-quality"), h.cfg.WebP.Quality)
-	imageURL := buildImageURL(h.upstreamScheme, origin, r.URL.Path, r.URL.RawQuery)
+	// EscapedPath, not Path: the origin must see %2F, %3F and %23 exactly as
+	// the client sent them, or a decoded path would change the target URL.
+	imageURL := buildImageURL(h.upstreamScheme, origin, r.URL.EscapedPath(), r.URL.RawQuery)
 	key := cacheKey(imageURL, quality)
 	useCache := h.cfg.Cache.CacheEnabled && r.Header.Get(h.cfg.Cache.NoCacheHeader) != "true"
 

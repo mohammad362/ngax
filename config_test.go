@@ -73,6 +73,21 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 	}
 }
 
+// concurrency.max_goroutines is a removed knob from the pre-rewrite service.
+// It must still decode (so an old config.yaml loads) but must not influence
+// the conversion limit, which stays at its own default.
+func TestLoadConfigIgnoresDeprecatedMaxGoroutines(t *testing.T) {
+	dir := writeConfig(t, minimalYAML+"concurrency:\n  max_goroutines: 500\n")
+	config = Config{}
+	if err := loadConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+	if config.Concurrency.MaxConversions != runtime.NumCPU() {
+		t.Fatalf("max_goroutines must be ignored: want max_conversions %d, got %d",
+			runtime.NumCPU(), config.Concurrency.MaxConversions)
+	}
+}
+
 func TestNegativeTTLDisabledByNegativeValue(t *testing.T) {
 	c := &Config{}
 	c.Cache.NegativeTTLSeconds = -1
@@ -108,18 +123,54 @@ func TestLoadConfigRejectsBadUpstreamScheme(t *testing.T) {
 
 func TestNewHTTPClientUsesIdleConnLimits(t *testing.T) {
 	c := &Config{}
+	c.AllowedHosts = map[string]string{"a.test": "origin-a.test", "b.test": "origin-b.test"}
 	c.applyDefaults()
 	c.HTTPClient.MaxIdleConnsPerHost = 33
 	client := newHTTPClient(c)
 	tr := client.Transport.(*http.Transport)
-	if tr.MaxIdleConnsPerHost != 33 || tr.MaxIdleConns != 33 {
-		t.Fatalf("want idle limits 33/33, got %d/%d", tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
+	// Two distinct origins: the total pool must be able to hold the per-host
+	// pool of each of them, otherwise the global cap silently throttles one.
+	if tr.MaxIdleConnsPerHost != 33 || tr.MaxIdleConns != 66 {
+		t.Fatalf("want idle limits 33 per host / 66 total, got %d/%d", tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
 	}
 	if !tr.ForceAttemptHTTP2 {
 		t.Fatal("want ForceAttemptHTTP2")
 	}
 	if client.Timeout != 30*time.Second {
 		t.Fatalf("want 30s timeout, got %v", client.Timeout)
+	}
+}
+
+func TestNewHTTPClientCountsDistinctOriginsNotHosts(t *testing.T) {
+	c := &Config{}
+	c.AllowedHosts = map[string]string{"a.test": "shared.origin.test", "b.test": "shared.origin.test"}
+	c.applyDefaults()
+	c.HTTPClient.MaxIdleConnsPerHost = 33
+	tr := newHTTPClient(c).Transport.(*http.Transport)
+	if tr.MaxIdleConns != 33 {
+		t.Fatalf("two hosts sharing one origin: want MaxIdleConns 33, got %d", tr.MaxIdleConns)
+	}
+}
+
+func TestExporterUnauthenticatedOnPublicBind(t *testing.T) {
+	cases := []struct {
+		ip, user, pass string
+		want           bool
+	}{
+		{"127.0.0.1", "", "", false},
+		{"localhost", "", "", false},
+		{"::1", "", "", false},
+		{"0.0.0.0", "", "", true},
+		{"0.0.0.0", "u", "", true},
+		{"0.0.0.0", "u", "p", false},
+		{"10.0.0.5", "", "p", true},
+	}
+	for _, tc := range cases {
+		c := &Config{}
+		c.Exporter.BindIP, c.Exporter.User, c.Exporter.Password = tc.ip, tc.user, tc.pass
+		if got := c.exporterUnauthenticatedOnPublicBind(); got != tc.want {
+			t.Errorf("bind=%q user=%q pass=%q: want %v, got %v", tc.ip, tc.user, tc.pass, tc.want, got)
+		}
 	}
 }
 

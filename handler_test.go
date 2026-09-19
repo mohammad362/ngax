@@ -15,12 +15,19 @@ import (
 )
 
 type handlerFixture struct {
-	h        *Handler
-	cache    *ImageCache
-	origin   *httptest.Server
-	fetches  atomic.Int32
-	gate     chan struct{} // when non-nil, origin blocks until closed
-	notFound atomic.Bool
+	h           *Handler
+	cache       *ImageCache
+	origin      *httptest.Server
+	fetches     atomic.Int32
+	gate        chan struct{} // when non-nil, origin blocks until closed
+	notFound    atomic.Bool
+	serverError atomic.Bool
+	lastURI     atomic.Value // string: the raw request URI the origin received
+}
+
+func (fx *handlerFixture) originRequestURI() string {
+	v, _ := fx.lastURI.Load().(string)
+	return v
 }
 
 func newFixture(t *testing.T) *handlerFixture {
@@ -29,11 +36,16 @@ func newFixture(t *testing.T) *handlerFixture {
 	data := pngBytes(t)
 	fx.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fx.fetches.Add(1)
+		fx.lastURI.Store(r.RequestURI)
 		if fx.gate != nil {
 			<-fx.gate
 		}
 		if fx.notFound.Load() {
 			http.NotFound(w, r)
+			return
+		}
+		if fx.serverError.Load() {
+			http.Error(w, "boom", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")
@@ -205,6 +217,46 @@ func TestHandlerNegativeCachesOrigin404(t *testing.T) {
 	}
 	if testutil.ToFloat64(negativeHitsTotal)-before != 1 {
 		t.Fatal("negative hit counter did not increase")
+	}
+}
+
+// A 5xx from the origin is transient: it must be reported as 502 and counted,
+// but never written to the negative cache, or one bad minute at the origin
+// would blank the image for a whole negative TTL.
+func TestHandlerDoesNotNegativelyCacheOrigin5xx(t *testing.T) {
+	fx := newFixture(t)
+	fx.serverError.Store(true)
+	before := testutil.ToFloat64(errorsTotal)
+
+	if rec := fx.get("/boom.png", nil); rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502 for origin 503, got %d", rec.Code)
+	}
+	if delta := testutil.ToFloat64(errorsTotal) - before; delta != 1 {
+		t.Fatalf("want errorsTotal +1, got +%v", delta)
+	}
+	fx.cache.Wait()
+
+	key := cacheKey(fx.h.upstreamScheme+fx.h.cfg.AllowedHosts["cdn.test"]+"/boom.png", 75)
+	if _, ok := fx.cache.GetNegative(key); ok {
+		t.Fatal("origin 5xx must not be negatively cached")
+	}
+	if rec := fx.get("/boom.png", nil); rec.Code != http.StatusBadGateway {
+		t.Fatalf("second request: want 502, got %d", rec.Code)
+	}
+	if fx.fetches.Load() != 2 {
+		t.Fatalf("want the origin retried (2 fetches), got %d", fx.fetches.Load())
+	}
+}
+
+// The origin must receive the path exactly as the client escaped it: %2F is
+// not a path separator, %3F is not the start of a query string.
+func TestHandlerForwardsEscapedPath(t *testing.T) {
+	fx := newFixture(t)
+	if rec := fx.get("/a%3Fb%2Fc.png", nil); rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := fx.originRequestURI(); got != "/a%3Fb%2Fc.png" {
+		t.Fatalf("origin saw %q, want %q (escaping was decoded before forwarding)", got, "/a%3Fb%2Fc.png")
 	}
 }
 
