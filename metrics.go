@@ -27,15 +27,33 @@ var (
 	totalImageSizeBeforeConversion = prometheus.NewCounter(prometheus.CounterOpts{Name: "ngax_total_image_size_before_conversion_bytes", Help: "Total size of images before conversion in bytes."})
 	totalImageSizeAfterConversion  = prometheus.NewCounter(prometheus.CounterOpts{Name: "ngax_total_image_size_after_conversion_bytes", Help: "Total size of images after conversion in bytes."})
 	invalidHostsCount              = prometheus.NewCounter(prometheus.CounterOpts{Name: "ngax_invalid_hosts_count", Help: "Count of unauthorized host access attempts."})
-	cacheBytes                     = prometheus.NewGauge(prometheus.GaugeOpts{Name: "ngax_cache_bytes", Help: "Approximate bytes held by the image cache."})
 )
 
 func init() {
 	prometheus.MustRegister(
 		requestsTotal, responseDuration, cacheHitsTotal, cacheMissesTotal, negativeHitsTotal,
 		coalescedTotal, errorsTotal, totalImageSizeBeforeConversion, totalImageSizeAfterConversion,
-		invalidHostsCount, cacheBytes,
+		invalidHostsCount,
 	)
+}
+
+// cacheBytesCollector builds the GaugeFunc collector that reports
+// ngax_cache_bytes, read from the cache's own admitted-cost counters at
+// scrape time rather than written on the request hot path. Extracted as its
+// own function so it can be tested against a fresh registry, since
+// MustRegister on the default registry can only run once per process.
+func cacheBytesCollector(c *ImageCache) prometheus.Collector {
+	return prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "ngax_cache_bytes", Help: "Approximate bytes held by the image cache."},
+		func() float64 { return float64(c.Bytes()) },
+	)
+}
+
+// registerCacheBytes exposes ngax_cache_bytes as a gauge read at scrape time
+// from the cache's own admitted-cost counters, keeping the write path free of
+// metric bookkeeping. Call it once for the process-wide cache.
+func registerCacheBytes(c *ImageCache) {
+	prometheus.MustRegister(cacheBytesCollector(c))
 }
 
 // statusRecorder captures the status code written by a handler so metrics

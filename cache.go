@@ -84,20 +84,10 @@ func (c *ImageCache) Get(key string) (Entry, bool) {
 	return c.images.Get(key)
 }
 
-// Set stores e; the insert is applied by ristretto's background writer and
-// may be dropped under contention or rejected by the admission policy, which
-// is acceptable for a cache. cacheBytes is refreshed from ristretto's own
-// admitted-cost counters afterwards so it never drifts from what the cache
-// actually holds. Set waits for its own write to be applied first: ristretto
-// updates CostAdded/CostEvicted asynchronously, so reading Bytes() without
-// waiting would race the background writer and observe a stale, pre-item
-// value (confirmed empirically: 5/5 runs under-counted by exactly one item's
-// cost, not merely flaky).
+// Set stores e. The insert is asynchronous and may be rejected by the
+// admission policy, which is acceptable for a cache.
 func (c *ImageCache) Set(key string, e Entry) {
-	cost := int64(len(e.Data))
-	c.images.Set(key, e, cost)
-	c.images.Wait()
-	cacheBytes.Set(float64(c.Bytes()))
+	c.images.Set(key, e, int64(len(e.Data)))
 }
 
 // Bytes returns the approximate bytes of admitted entries: ristretto counts

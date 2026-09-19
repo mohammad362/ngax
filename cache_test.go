@@ -95,17 +95,21 @@ func TestNegativeCacheDisabledWhenTTLZero(t *testing.T) {
 
 func TestCacheBytesReflectsAdmittedCost(t *testing.T) {
 	c := newTestCache(t, 1<<20, 0)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		c.Set(fmt.Sprintf("k%d", i), NewEntry(make([]byte, 100)))
 	}
-	c.Wait()
-	c.Set("k3", NewEntry(make([]byte, 100))) // gauge is refreshed on Set
 	c.Wait()
 	if got := c.Bytes(); got != 400 {
 		t.Fatalf("want 400 admitted bytes, got %d", got)
 	}
-	if g := testutil.ToFloat64(cacheBytes); g != 400 {
-		t.Fatalf("gauge want 400, got %v", g)
+}
+
+func TestCacheBytesCollectorReadsCache(t *testing.T) {
+	c := newTestCache(t, 1<<20, 0)
+	c.Set("k", NewEntry(make([]byte, 100)))
+	c.Wait()
+	if got := testutil.ToFloat64(cacheBytesCollector(c)); got != 100 {
+		t.Fatalf("collector want 100, got %v", got)
 	}
 }
 
